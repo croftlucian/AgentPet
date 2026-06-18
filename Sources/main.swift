@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import ServiceManagement // SMAppService:开机自启,macOS 13+
 import Carbon.HIToolbox // RegisterEventHotKey 等:注册全局快捷键,无需辅助功能权限
 
 // MARK: - 外观与动画参数
@@ -104,6 +105,62 @@ private enum Settings {
         set { UserDefaults.standard.set(newValue, forKey: receiveTaskDoneNotificationsKey) }
     }
 
+    // MARK: 陪跑 / 作息 / 窗口 —— 新增设置(各自缺省值见注释)
+    private static let petFocusOnStartKey = "petFocusOnStart"
+    private static let petNotifyOnWaitingKey = "petNotifyOnWaiting"
+    private static let petMoodDecayKey = "petMoodDecay"
+    private static let petSedentaryReminderKey = "petSedentaryReminder"
+    private static let petSedentaryMinutesKey = "petSedentaryMinutes"
+    private static let petNightDrowsyKey = "petNightDrowsy"
+    private static let petDockCornerKey = "petDockCorner"
+    static let defaultSedentaryMinutes = 50
+    static let minSedentaryMinutes = 10
+    static let maxSedentaryMinutes = 180
+
+    /// 带默认值的 UserDefaults 读取:未写入过时返回 def,避免 bool/integer 把"没设过"误读成 false/0。
+    private static func boolValue(_ key: String, default def: Bool) -> Bool {
+        UserDefaults.standard.object(forKey: key) == nil ? def : UserDefaults.standard.bool(forKey: key)
+    }
+    private static func intValue(_ key: String, default def: Int) -> Int {
+        UserDefaults.standard.object(forKey: key) == nil ? def : UserDefaults.standard.integer(forKey: key)
+    }
+
+    /// 陪跑:开工进专注态,缺省开
+    static var petFocusOnStart: Bool {
+        get { boolValue(petFocusOnStartKey, default: true) }
+        set { UserDefaults.standard.set(newValue, forKey: petFocusOnStartKey) }
+    }
+    /// 陪跑:等确认时提醒,缺省开
+    static var petNotifyOnWaiting: Bool {
+        get { boolValue(petNotifyOnWaitingKey, default: true) }
+        set { UserDefaults.standard.set(newValue, forKey: petNotifyOnWaitingKey) }
+    }
+    /// 作息:会饿会蔫,缺省开
+    static var petMoodDecay: Bool {
+        get { boolValue(petMoodDecayKey, default: true) }
+        set { UserDefaults.standard.set(newValue, forKey: petMoodDecayKey) }
+    }
+    /// 作息:久坐提醒,缺省关
+    static var petSedentaryReminder: Bool {
+        get { boolValue(petSedentaryReminderKey, default: false) }
+        set { UserDefaults.standard.set(newValue, forKey: petSedentaryReminderKey) }
+    }
+    /// 作息:久坐提醒间隔(分钟),默认 50,夹在 10~180
+    static var petSedentaryMinutes: Int {
+        get { min(max(intValue(petSedentaryMinutesKey, default: defaultSedentaryMinutes), minSedentaryMinutes), maxSedentaryMinutes) }
+        set { UserDefaults.standard.set(min(max(newValue, minSedentaryMinutes), maxSedentaryMinutes), forKey: petSedentaryMinutesKey) }
+    }
+    /// 作息:深夜犯困,缺省开
+    static var petNightDrowsy: Bool {
+        get { boolValue(petNightDrowsyKey, default: true) }
+        set { UserDefaults.standard.set(newValue, forKey: petNightDrowsyKey) }
+    }
+    /// 窗口:停靠角(见 DockCorner.rawValue,0=左上 1=右上 2=左下 3=右下),默认右下
+    static var petDockCorner: Int {
+        get { intValue(petDockCornerKey, default: 3) }
+        set { UserDefaults.standard.set(newValue, forKey: petDockCornerKey) }
+    }
+
     /// 泛化的 IM 通知开关读写(微信/飞书共用),按 UserDefaults 键存取,缺省关闭。
     static func imNotificationsEnabled(_ key: String) -> Bool {
         UserDefaults.standard.object(forKey: key) == nil ? false : UserDefaults.standard.bool(forKey: key)
@@ -114,10 +171,33 @@ private enum Settings {
     }
 }
 
+/// 桌宠停靠屏幕四角之一(rawValue 存入 UserDefaults 的 petDockCorner)
+private enum DockCorner: Int, CaseIterable {
+    case topLeft = 0, topRight = 1, bottomLeft = 2, bottomRight = 3
+    var title: String {
+        switch self {
+        case .topLeft: return "左上角"
+        case .topRight: return "右上角"
+        case .bottomLeft: return "左下角"
+        case .bottomRight: return "右下角"
+        }
+    }
+    /// 据屏幕可见区与窗口尺寸算停靠原点(留边距;右下与原逻辑一致:maxX-宽-40, minY+40)
+    func origin(in visible: NSRect, size: CGSize, margin: CGFloat = 40) -> NSPoint {
+        let onLeft = (self == .topLeft || self == .bottomLeft)
+        let onTop = (self == .topLeft || self == .topRight)
+        return NSPoint(x: onLeft ? visible.minX + margin : visible.maxX - size.width - margin,
+                       y: onTop ? visible.maxY - size.height - margin : visible.minY + margin)
+    }
+    static var current: DockCorner { DockCorner(rawValue: Settings.petDockCorner) ?? .bottomRight }
+}
+
 private extension Notification.Name {
     static let petColorDidChange = Notification.Name("ClaudePet.petColorDidChange")
     static let autoAdaptColorDidChange = Notification.Name("ClaudePet.autoAdaptColorDidChange")
     static let weChatNotificationsDidChange = Notification.Name("ClaudePet.weChatNotificationsDidChange")
+    static let dockCornerDidChange = Notification.Name("ClaudePet.dockCornerDidChange")
+    static let petBehaviorDidChange = Notification.Name("ClaudePet.petBehaviorDidChange")
 }
 
 private extension NSColor {
@@ -188,6 +268,19 @@ final class PetView: NSView {
     private var isHovering = false
     /// 扑食动作进行中标志:防连按时把"归位坐标"记成动画途中的中间值
     private var isPouncing = false
+    /// 陪跑活跃会话:sid → 最近事件时间。非空即"在忙"(进专注态),全空才歇;多终端并发按 sid 聚合。
+    private var activeSessions: [String: Date] = [:]
+    /// 活跃会话超时清理:某终端崩了没发 done 会赖在集合里,定时踢出陈旧会话,免得永远卡专注。
+    private var sessionSweepTimer: Timer?
+    /// 是否有任意会话在跑——驱动专注呼吸与"全部收工才歇"。
+    private var isWorking: Bool { !activeSessions.isEmpty }
+    /// 上次被搭理(摸/喂/嚼)的时刻;久无互动会"蔫"。
+    private var lastInteractionAt = Date()
+    /// 正蔫着:缩着身子、慢呼吸、垂眼;被搭理即回血。
+    private var isDrooping = false
+    private var moodTimer: Timer?            // 会饿会蔫的低频检查
+    private var sedentaryTimer: Timer?       // 久坐提醒
+    private static let moodDecaySeconds: TimeInterval = 30 * 60   // 30 分钟没人理就蔫
 
     private var petFrameInBounds: CGRect {
         CGRect(x: (bounds.width - Style.windowSize) / 2,
@@ -219,6 +312,7 @@ final class PetView: NSView {
         NotificationCenter.default.addObserver(self, selector: #selector(handlePetColorDidChange(_:)), name: .petColorDidChange, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(handleAutoAdaptColorDidChange(_:)), name: .autoAdaptColorDidChange, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(handleWeChatNotificationsDidChange(_:)), name: .weChatNotificationsDidChange, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(handleBehaviorDidChange(_:)), name: .petBehaviorDidChange, object: nil)
     }
 
     @available(*, unavailable)
@@ -230,6 +324,9 @@ final class PetView: NSView {
         weChatNotificationTimer?.invalidate()
         noticeHintTimer?.invalidate()
         bannerHideTimer?.invalidate()
+        sessionSweepTimer?.invalidate()
+        moodTimer?.invalidate()
+        sedentaryTimer?.invalidate()
     }
 
     // MARK: 图层装配
@@ -284,19 +381,34 @@ final class PetView: NSView {
         updateBackgroundColorSampling()
         updateWeChatNotificationMonitor()
         scheduleIdle()        // 启动空闲动作调度
+        startMoodTimer()      // 启动"会饿会蔫"低频检查
+        startSedentaryTimerIfNeeded()  // 久坐提醒(受开关控制)
     }
 
     // MARK: 呼吸动画(交给 Core Animation,无需逐帧重绘)
     // 常态在 0.95~1.0 间缓缓缩放;悬停时换成放大区间(见 onHoverBegin),呼吸不停、只是"鼓"起来。
-    private func startBreathing(scaleLow: CGFloat = 0.95, scaleHigh: CGFloat = 1.0) {
+    private func startBreathing(scaleLow: CGFloat = 0.95, scaleHigh: CGFloat = 1.0, period: Double = Style.breathPeriod) {
         let breathe = CABasicAnimation(keyPath: "transform.scale")
         breathe.fromValue = scaleLow
         breathe.toValue = scaleHigh
-        breathe.duration = Style.breathPeriod / 2
+        breathe.duration = period / 2
         breathe.autoreverses = true
         breathe.repeatCount = .infinity
         breathe.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
         iconLayer.add(breathe, forKey: "breathe") // 同 key 重加即替换,实现常态↔放大切换
+    }
+
+    /// 按当前状态选呼吸节奏:悬停最鼓、陪跑专注略鼓略快、否则常态。集中一处,避免各路调用各传参数互相覆盖。
+    private func applyBreathing() {
+        if isHovering {
+            startBreathing(scaleLow: 1.08, scaleHigh: 1.18)               // 悬停:鼓起来
+        } else if isWorking {
+            startBreathing(scaleLow: 0.97, scaleHigh: 1.05, period: 3.4)  // 陪跑专注:略鼓、略快
+        } else if isDrooping {
+            startBreathing(scaleLow: 0.92, scaleHigh: 0.97, period: 9)    // 蔫:缩着、慢吞吞
+        } else {
+            startBreathing()                                              // 常态
+        }
     }
 
     // MARK: 眼睛跟随鼠标方向
@@ -945,6 +1057,7 @@ final class PetView: NSView {
     // 普通定时器与部分隐式动画不会触发,.common 才能保证“嚼”起来。
     private func startEating() {
         Self.log("startEating")
+        noteInteraction()                                // 喂/嚼 = 被搭理,回血
         guard chewTimer == nil else { return }
         mouthOpen = 1
         render()                                         // 立即张嘴,给即时反馈
@@ -995,11 +1108,12 @@ final class PetView: NSView {
 
     override func mouseEntered(with event: NSEvent) {
         guard !isHovering else { return }
+        noteInteraction()                // 摸一下 = 被搭理,回血
         isHovering = true
         eyeMode = .happy                 // 眯眼笑
         render()
         setFeedGlow(true)                // 点亮橙光
-        startBreathing(scaleLow: 1.08, scaleHigh: 1.18) // 鼓起来:放大版呼吸
+        applyBreathing()                 // 鼓起来:放大版呼吸(悬停最优先)
         jump()                           // 开心蹦一下
     }
 
@@ -1009,7 +1123,7 @@ final class PetView: NSView {
         eyeMode = .normal
         render()
         if chewTimer == nil { setFeedGlow(false) } // 进食中则交给进食收尾,避免抢着熄灯
-        startBreathing()                 // 复位常态呼吸
+        applyBreathing()                 // 退出悬停:回到专注(若在陪跑)或常态呼吸
     }
 
     // MARK: 点击互动
@@ -1133,9 +1247,129 @@ final class PetView: NSView {
     }
 
     private func performRandomIdle() {
-        guard !isHovering, !isPouncing, chewTimer == nil, biteTimer == nil, !idleEyeActive else { return }
-        let actions = [blink, blink, lookAround, sway, yawn] // blink 权重高些,最自然
+        guard !isHovering, !isPouncing, !isWorking, !isDrooping, chewTimer == nil, biteTimer == nil, !idleEyeActive else { return }
+        var actions = [blink, blink, lookAround, sway, yawn] // blink 权重高些,最自然
+        if Settings.petNightDrowsy, Self.isLateNight() {
+            actions = [yawn, yawn, blink, lookAround]         // 深夜:多打哈欠犯困
+        }
         actions.randomElement()?()
+    }
+
+    // MARK: 陪跑指示灯(随 Claude/Codex 生命周期事件:开工进专注、等确认提醒、收工庆祝)
+    // 多终端并发按 sid 聚合:任意会话在跑就保持专注,全部收工才歇;某会话崩了没发 done 由超时清理兜底。
+    private static let waitingAccent = NSColor(srgbRed: 0.96, green: 0.65, blue: 0.14, alpha: 0.95) // 琥珀黄,醒目催点头
+
+    /// 陪跑事件入口(由 AppDelegate 解析 claudepet:// 后调用)。phase ∈ start|waiting|done。
+    func handleCompanionEvent(phase: String, sid: String, message: String) {
+        switch phase {
+        case "start":
+            guard Settings.petFocusOnStart else { return }
+            let wasIdle = activeSessions.isEmpty
+            activeSessions[sid] = Date()
+            startSessionSweep()
+            if wasIdle { enterFocus() }     // 刚从"歇"变"忙":切专注呼吸
+        case "waiting":
+            if Settings.petFocusOnStart { activeSessions[sid] = Date() } // 仍在跑,顺延存活时间
+            guard Settings.petNotifyOnWaiting else { return }
+            flashNotice(message, accent: Self.waitingAccent)             // 跳出来催主公点头
+        case "done":
+            let had = activeSessions.removeValue(forKey: sid) != nil
+            if Settings.receiveTaskDoneNotifications {
+                showTaskDoneHint(message: message)                       // 报喜横幅(带目录/任务)
+            }
+            if had && activeSessions.isEmpty { leaveFocus() }            // 全部收工才退专注
+        default:
+            break
+        }
+    }
+
+    /// 进/退专注态:只切呼吸节奏(isWorking 已随 activeSessions 变化);专注期间 performRandomIdle 自动让路不打扰。
+    private func enterFocus() { applyBreathing() }
+    private func leaveFocus() { applyBreathing() }
+
+    private func startSessionSweep() {
+        guard sessionSweepTimer == nil else { return }
+        let t = Timer(timeInterval: 60, repeats: true) { [weak self] _ in self?.sweepStaleSessions() }
+        RunLoop.main.add(t, forMode: .common)   // .common:拖放/事件跟踪期间也照常清理
+        sessionSweepTimer = t
+    }
+
+    /// 踢出超过 10 分钟没动静的会话(崩溃/被杀没发 done 的兜底);清空后停表并退专注。
+    private func sweepStaleSessions() {
+        guard !activeSessions.isEmpty else {
+            sessionSweepTimer?.invalidate(); sessionSweepTimer = nil; return
+        }
+        let now = Date()
+        activeSessions = activeSessions.filter { now.timeIntervalSince($0.value) < 600 }
+        if activeSessions.isEmpty {
+            leaveFocus()
+            sessionSweepTimer?.invalidate(); sessionSweepTimer = nil
+        }
+    }
+
+    // MARK: 作息脾气(会饿会蔫 / 久坐提醒 / 深夜犯困)
+    // 都接现有呼吸/空闲/横幅:蔫=慢呼吸+垂眼、久坐=定时横幅、深夜=空闲多打哈欠。纯本地,无权限。
+    /// 被搭理(摸/喂/嚼):刷新互动时刻,蔫着就回血。
+    private func noteInteraction() {
+        lastInteractionAt = Date()
+        if isDrooping { reviveFromDroop() }
+    }
+
+    private func reviveFromDroop() {
+        isDrooping = false
+        idleEyeActive = false
+        eyeLook = .zero
+        eyeMode = isHovering ? .happy : .normal
+        render()
+        applyBreathing()
+    }
+
+    private func startMoodTimer() {
+        guard moodTimer == nil else { return }
+        let t = Timer(timeInterval: 60, repeats: true) { [weak self] _ in self?.checkMood() }
+        RunLoop.main.add(t, forMode: .common)
+        moodTimer = t
+    }
+
+    /// 久无互动则蔫;关了开关或正忙/悬停/进食/陪跑时一律让路。
+    private func checkMood() {
+        if !Settings.petMoodDecay {
+            if isDrooping { reviveFromDroop() }
+            return
+        }
+        guard !isDrooping, !isHovering, !isPouncing, !isWorking, chewTimer == nil, biteTimer == nil else { return }
+        if Date().timeIntervalSince(lastInteractionAt) > Self.moodDecaySeconds { enterDroop() }
+    }
+
+    private func enterDroop() {
+        isDrooping = true
+        idleEyeActive = true                       // 接管眼睛垂下,防 eyeFollow 拉回
+        eyeMode = .normal
+        eyeLook = CGVector(dx: 0, dy: -0.7)        // 眼神朝下,无精打采
+        render()
+        applyBreathing()                           // 切慢呼吸(缩着)
+    }
+
+    /// 久坐提醒:固定间隔弹横幅催起身。受开关与间隔(分钟)控制,设置改后由 handleBehaviorDidChange 重配。
+    private func startSedentaryTimerIfNeeded() {
+        sedentaryTimer?.invalidate(); sedentaryTimer = nil
+        guard Settings.petSedentaryReminder else { return }
+        let interval = TimeInterval(Settings.petSedentaryMinutes * 60)
+        let t = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+            self?.flashNotice("久坐了,起来动动,主公", accent: Self.waitingAccent)
+        }
+        RunLoop.main.add(t, forMode: .common)
+        sedentaryTimer = t
+    }
+
+    @objc private func handleBehaviorDidChange(_ notification: Notification) {
+        startSedentaryTimerIfNeeded()                                // 久坐开关/间隔变化 → 重配
+        if !Settings.petMoodDecay, isDrooping { reviveFromDroop() }  // 关了会饿 → 立即回血
+    }
+
+    private static func isLateNight() -> Bool {
+        let h = Calendar.current.component(.hour, from: Date())
+        return h >= 23 || h < 5
     }
 
     // MARK: 快捷键投喂:扑食动作
@@ -1631,6 +1865,13 @@ final class PetView: NSView {
           exit 127
         fi
         "$TOOL" \(shellQuoted(prompt))
+        rc=$?
+        echo
+        if [[ $rc -ne 0 ]]; then
+          echo "[ClaudePet] 工具异常退出(状态码 $rc),上方若有报错请据此排查。"
+        fi
+        echo "[ClaudePet] 会话结束,按回车键关闭此窗口…"
+        read < /dev/tty
         """
     }
 
@@ -1650,8 +1891,8 @@ enum FeedTool {
     /// 取不到 alias,这一步通常落空,真正生效的是 fallbackPaths 里的同名内置包装脚本。
     var commands: [String] {
         switch self {
-        case .claude: return ["cc"]
-        case .codex:  return ["cx"]
+        case .claude: return []
+        case .codex:  return []
         }
     }
 
@@ -1754,6 +1995,15 @@ final class SettingsWindowController: NSWindowController {
     private let weChatNotificationsButton = NSButton(checkboxWithTitle: "接收微信", target: nil, action: nil)
     private let larkNotificationsButton = NSButton(checkboxWithTitle: "接收飞书", target: nil, action: nil)
     private let taskDoneNotificationsButton = NSButton(checkboxWithTitle: "任务完成提示", target: nil, action: nil)
+    private let focusOnStartButton = NSButton(checkboxWithTitle: "开工进专注态", target: nil, action: nil)
+    private let notifyOnWaitingButton = NSButton(checkboxWithTitle: "等我确认时提醒", target: nil, action: nil)
+    private let moodDecayButton = NSButton(checkboxWithTitle: "会饿会蔫", target: nil, action: nil)
+    private let sedentaryButton = NSButton(checkboxWithTitle: "久坐提醒", target: nil, action: nil)
+    private let sedentaryStepper = NSStepper()
+    private let sedentaryLabel = NSTextField(labelWithString: "")
+    private let nightDrowsyButton = NSButton(checkboxWithTitle: "深夜犯困", target: nil, action: nil)
+    private let dockCornerPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let launchAtLoginButton = NSButton(checkboxWithTitle: "开机自启", target: nil, action: nil)
     private let slider = NSSlider(value: Settings.pounceDuration,
                                   minValue: Settings.minPounceDuration,
                                   maxValue: Settings.maxPounceDuration,
@@ -1761,7 +2011,7 @@ final class SettingsWindowController: NSWindowController {
                                   action: nil)
 
     init() {
-        let content = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 320))
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: 360, height: 620))
         let window = NSWindow(
             contentRect: content.frame,
             styleMask: [.titled, .closable],
@@ -1777,71 +2027,136 @@ final class SettingsWindowController: NSWindowController {
         colorWell.color = Settings.petColor
         updateColorControls()
         updateWeChatControls()
+        updateCompanionControls()
+        updateBehaviorControls()
+        updateWindowControls()
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("不支持 Interface Builder 加载") }
 
     private func buildContent(in content: NSView) {
-        let title = NSTextField(labelWithString: "移动速度")
-        title.font = .systemFont(ofSize: 15, weight: .semibold)
-        title.frame = NSRect(x: 24, y: 278, width: 120, height: 22)
-        content.addSubview(title)
+        // 分组小标题:加粗次级色,统一各组的视觉分隔
+        func section(_ text: String, y: CGFloat) {
+            let label = NSTextField(labelWithString: text)
+            label.font = .systemFont(ofSize: 13, weight: .bold)
+            label.textColor = .secondaryLabelColor
+            label.frame = NSRect(x: 24, y: y, width: 312, height: 18)
+            content.addSubview(label)
+        }
 
+        // —— 互动 ——
+        section("互动", y: 588)
+        let speedTitle = NSTextField(labelWithString: "移动速度")
+        speedTitle.frame = NSRect(x: 24, y: 558, width: 120, height: 22)
+        content.addSubview(speedTitle)
         valueLabel.alignment = .right
-        valueLabel.frame = NSRect(x: 180, y: 278, width: 116, height: 22)
+        valueLabel.frame = NSRect(x: 200, y: 558, width: 136, height: 22)
         content.addSubview(valueLabel)
 
         slider.target = self
         slider.action = #selector(sliderChanged(_:))
         slider.numberOfTickMarks = 6
         slider.allowsTickMarkValuesOnly = false
-        slider.frame = NSRect(x: 24, y: 240, width: 272, height: 24)
+        slider.frame = NSRect(x: 24, y: 532, width: 312, height: 24)
         content.addSubview(slider)
 
         let fast = NSTextField(labelWithString: "快")
         fast.textColor = .secondaryLabelColor
-        fast.frame = NSRect(x: 24, y: 214, width: 40, height: 18)
+        fast.frame = NSRect(x: 24, y: 510, width: 40, height: 18)
         content.addSubview(fast)
-
         let slow = NSTextField(labelWithString: "慢")
         slow.textColor = .secondaryLabelColor
         slow.alignment = .right
-        slow.frame = NSRect(x: 256, y: 214, width: 40, height: 18)
+        slow.frame = NSRect(x: 296, y: 510, width: 40, height: 18)
         content.addSubview(slow)
 
-        colorTitle.font = .systemFont(ofSize: 15, weight: .semibold)
-        colorTitle.frame = NSRect(x: 24, y: 176, width: 100, height: 22)
+        colorTitle.font = .systemFont(ofSize: 13, weight: .regular)
+        colorTitle.frame = NSRect(x: 24, y: 480, width: 120, height: 22)
         content.addSubview(colorTitle)
-
         colorWell.target = self
         colorWell.action = #selector(colorChanged(_:))
-        colorWell.frame = NSRect(x: 248, y: 170, width: 48, height: 32)
+        colorWell.frame = NSRect(x: 288, y: 476, width: 48, height: 30)
         content.addSubview(colorWell)
 
         autoAdaptButton.target = self
         autoAdaptButton.action = #selector(autoAdaptChanged(_:))
-        autoAdaptButton.frame = NSRect(x: 24, y: 134, width: 160, height: 24)
+        autoAdaptButton.frame = NSRect(x: 24, y: 446, width: 220, height: 24)
         content.addSubview(autoAdaptButton)
 
-        weChatNotificationsButton.target = self
-        weChatNotificationsButton.action = #selector(weChatNotificationsChanged(_:))
-        weChatNotificationsButton.frame = NSRect(x: 24, y: 96, width: 130, height: 24)
-        content.addSubview(weChatNotificationsButton)
-
-        larkNotificationsButton.target = self
-        larkNotificationsButton.action = #selector(larkNotificationsChanged(_:))
-        larkNotificationsButton.frame = NSRect(x: 168, y: 96, width: 130, height: 24)
-        content.addSubview(larkNotificationsButton)
-
+        // —— 陪跑(Claude Code / Codex)——
+        section("陪跑(Claude Code / Codex)", y: 412)
+        focusOnStartButton.target = self
+        focusOnStartButton.action = #selector(focusOnStartChanged(_:))
+        focusOnStartButton.frame = NSRect(x: 24, y: 384, width: 220, height: 24)
+        content.addSubview(focusOnStartButton)
+        notifyOnWaitingButton.target = self
+        notifyOnWaitingButton.action = #selector(notifyOnWaitingChanged(_:))
+        notifyOnWaitingButton.frame = NSRect(x: 24, y: 358, width: 240, height: 24)
+        content.addSubview(notifyOnWaitingButton)
         taskDoneNotificationsButton.target = self
         taskDoneNotificationsButton.action = #selector(taskDoneNotificationsChanged(_:))
-        taskDoneNotificationsButton.frame = NSRect(x: 24, y: 58, width: 200, height: 24)
+        taskDoneNotificationsButton.frame = NSRect(x: 24, y: 332, width: 220, height: 24)
         content.addSubview(taskDoneNotificationsButton)
+
+        // —— 作息脾气 ——
+        section("作息脾气", y: 298)
+        moodDecayButton.target = self
+        moodDecayButton.action = #selector(moodDecayChanged(_:))
+        moodDecayButton.frame = NSRect(x: 24, y: 270, width: 160, height: 24)
+        content.addSubview(moodDecayButton)
+
+        sedentaryButton.target = self
+        sedentaryButton.action = #selector(sedentaryChanged(_:))
+        sedentaryButton.frame = NSRect(x: 24, y: 244, width: 110, height: 24)
+        content.addSubview(sedentaryButton)
+        sedentaryStepper.target = self
+        sedentaryStepper.action = #selector(sedentaryStepperChanged(_:))
+        sedentaryStepper.minValue = Double(Settings.minSedentaryMinutes)
+        sedentaryStepper.maxValue = Double(Settings.maxSedentaryMinutes)
+        sedentaryStepper.increment = 5
+        sedentaryStepper.integerValue = Settings.petSedentaryMinutes
+        sedentaryStepper.frame = NSRect(x: 138, y: 242, width: 20, height: 28)
+        content.addSubview(sedentaryStepper)
+        sedentaryLabel.textColor = .secondaryLabelColor
+        sedentaryLabel.frame = NSRect(x: 166, y: 244, width: 170, height: 22)
+        content.addSubview(sedentaryLabel)
+
+        nightDrowsyButton.target = self
+        nightDrowsyButton.action = #selector(nightDrowsyChanged(_:))
+        nightDrowsyButton.frame = NSRect(x: 24, y: 218, width: 160, height: 24)
+        content.addSubview(nightDrowsyButton)
+
+        // —— 通知 ——
+        section("通知", y: 184)
+        weChatNotificationsButton.target = self
+        weChatNotificationsButton.action = #selector(weChatNotificationsChanged(_:))
+        weChatNotificationsButton.frame = NSRect(x: 24, y: 156, width: 130, height: 24)
+        content.addSubview(weChatNotificationsButton)
+        larkNotificationsButton.target = self
+        larkNotificationsButton.action = #selector(larkNotificationsChanged(_:))
+        larkNotificationsButton.frame = NSRect(x: 168, y: 156, width: 130, height: 24)
+        content.addSubview(larkNotificationsButton)
+
+        // —— 窗口 ——
+        section("窗口", y: 122)
+        let dockTitle = NSTextField(labelWithString: "停靠")
+        dockTitle.frame = NSRect(x: 24, y: 92, width: 50, height: 22)
+        content.addSubview(dockTitle)
+        dockCornerPopup.target = self
+        dockCornerPopup.action = #selector(dockCornerChanged(_:))
+        dockCornerPopup.addItems(withTitles: DockCorner.allCases.map { $0.title })
+        dockCornerPopup.frame = NSRect(x: 80, y: 88, width: 150, height: 26)
+        content.addSubview(dockCornerPopup)
+
+        launchAtLoginButton.target = self
+        launchAtLoginButton.action = #selector(launchAtLoginChanged(_:))
+        launchAtLoginButton.frame = NSRect(x: 24, y: 58, width: 200, height: 24)
+        content.addSubview(launchAtLoginButton)
 
         let close = NSButton(title: "关闭", target: self, action: #selector(closeWindow(_:)))
         close.bezelStyle = .rounded
-        close.frame = NSRect(x: 218, y: 18, width: 78, height: 28)
+        close.frame = NSRect(x: 258, y: 18, width: 78, height: 28)
         content.addSubview(close)
     }
 
@@ -1884,6 +2199,56 @@ final class SettingsWindowController: NSWindowController {
         updateWeChatControls()
     }
 
+    @objc private func focusOnStartChanged(_ sender: NSButton) {
+        Settings.petFocusOnStart = sender.state == .on
+        NotificationCenter.default.post(name: .petBehaviorDidChange, object: nil)
+    }
+
+    @objc private func notifyOnWaitingChanged(_ sender: NSButton) {
+        Settings.petNotifyOnWaiting = sender.state == .on
+        NotificationCenter.default.post(name: .petBehaviorDidChange, object: nil)
+    }
+
+    @objc private func moodDecayChanged(_ sender: NSButton) {
+        Settings.petMoodDecay = sender.state == .on
+        NotificationCenter.default.post(name: .petBehaviorDidChange, object: nil)
+    }
+
+    @objc private func sedentaryChanged(_ sender: NSButton) {
+        Settings.petSedentaryReminder = sender.state == .on
+        updateBehaviorControls()
+        NotificationCenter.default.post(name: .petBehaviorDidChange, object: nil)
+    }
+
+    @objc private func sedentaryStepperChanged(_ sender: NSStepper) {
+        Settings.petSedentaryMinutes = sender.integerValue
+        updateBehaviorControls()
+        NotificationCenter.default.post(name: .petBehaviorDidChange, object: nil)
+    }
+
+    @objc private func nightDrowsyChanged(_ sender: NSButton) {
+        Settings.petNightDrowsy = sender.state == .on
+        NotificationCenter.default.post(name: .petBehaviorDidChange, object: nil)
+    }
+
+    @objc private func dockCornerChanged(_ sender: NSPopUpButton) {
+        Settings.petDockCorner = sender.indexOfSelectedItem
+        NotificationCenter.default.post(name: .dockCornerDidChange, object: nil)
+    }
+
+    @objc private func launchAtLoginChanged(_ sender: NSButton) {
+        do {
+            if sender.state == .on {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+        } catch {
+            PetView.log("开机自启切换失败: \(error)")
+        }
+        updateWindowControls()   // 以系统实际状态回填,失败时 UI 不至于与现实不符
+    }
+
     @objc private func closeWindow(_ sender: Any?) {
         close()
     }
@@ -1904,6 +2269,27 @@ final class SettingsWindowController: NSWindowController {
         larkNotificationsButton.state = Settings.imNotificationsEnabled("receiveLarkNotifications") ? .on : .off
         taskDoneNotificationsButton.state = Settings.receiveTaskDoneNotifications ? .on : .off
     }
+
+    private func updateCompanionControls() {
+        focusOnStartButton.state = Settings.petFocusOnStart ? .on : .off
+        notifyOnWaitingButton.state = Settings.petNotifyOnWaiting ? .on : .off
+    }
+
+    private func updateBehaviorControls() {
+        moodDecayButton.state = Settings.petMoodDecay ? .on : .off
+        nightDrowsyButton.state = Settings.petNightDrowsy ? .on : .off
+        let on = Settings.petSedentaryReminder
+        sedentaryButton.state = on ? .on : .off
+        sedentaryStepper.isEnabled = on
+        sedentaryStepper.integerValue = Settings.petSedentaryMinutes
+        sedentaryLabel.textColor = on ? .labelColor : .secondaryLabelColor
+        sedentaryLabel.stringValue = "每 \(Settings.petSedentaryMinutes) 分钟"
+    }
+
+    private func updateWindowControls() {
+        dockCornerPopup.selectItem(at: Settings.petDockCorner)
+        launchAtLoginButton.state = (SMAppService.mainApp.status == .enabled) ? .on : .off
+    }
 }
 
 @MainActor
@@ -1919,8 +2305,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         PetView.log("ClaudePet 启动 feed-script-v2")
         let appSize = Style.canvasSize
         let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        // 默认安静地待在屏幕右下角
-        let origin = NSPoint(x: screen.maxX - appSize.width - 40, y: screen.minY + 40)
+        // 默认停在用户选定的角(缺省右下);origin 计算收敛进 DockCorner
+        let origin = DockCorner.current.origin(in: screen, size: appSize)
 
         let win = NSWindow(
             contentRect: NSRect(origin: origin, size: appSize),
@@ -1952,6 +2338,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             GlobalHotKey.feedFromFinder(into: petView, with: .codex)
         }
         PetView.log("热键注册 ⌥⌘C(claude)=\(okClaude) ⌥⌘X(codex)=\(okCodex)")
+
+        // 设置里改停靠角 → 即时把窗口挪到新角
+        NotificationCenter.default.addObserver(self, selector: #selector(handleDockCornerDidChange(_:)), name: .dockCornerDidChange, object: nil)
+    }
+
+    @objc private func handleDockCornerDidChange(_ notification: Notification) {
+        guard let window = window else { return }
+        let visible = window.screen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? window.frame
+        window.setFrameOrigin(DockCorner.current.origin(in: visible, size: window.frame.size))
     }
 
     @objc func showSettings(_ sender: Any?) {
@@ -1976,27 +2371,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func handleClaudePetURL(_ url: URL) {
         let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
-        let action = url.host ?? components?.host ?? ""
-        guard action == "done" else { return }   // 目前只有 done 一种动作,host 留作未来扩展
-        guard Settings.receiveTaskDoneNotifications else {   // 设置里关掉就不打扰,直接忽略
-            PetView.log("任务完成提示已关闭,忽略 \(url.absoluteString)")
-            return
-        }
+        let phase = url.host ?? components?.host ?? ""
+        guard ["start", "waiting", "done"].contains(phase) else { return }   // host 即生命周期相位
         let items = components?.queryItems ?? []
         let tool = items.first { $0.name == "tool" }?.value ?? ""
         let cwd = items.first { $0.name == "cwd" || $0.name == "dir" }?.value
         let task = items.first { $0.name == "task" }?.value
-        // 节流:同一(工具+目录)在 taskDoneThrottle 秒内只弹一次,连答多轮不连珠炮
-        let throttleKey = "\(tool)|\(cwd ?? "")"
-        let now = Date()
-        if let last = lastTaskDoneAt[throttleKey], now.timeIntervalSince(last) < AppDelegate.taskDoneThrottle {
-            PetView.log("任务完成提示节流(\(Int(AppDelegate.taskDoneThrottle))s 内重复),跳过 \(url.absoluteString)")
-            return
+        let rawSid = items.first { $0.name == "sid" }?.value
+        let sid = (rawSid?.isEmpty == false) ? rawSid! : "\(tool)|\(cwd ?? "")"   // 脚本已兜底,这里再防空
+        // 横幅节流:waiting/done 同(相位|工具|目录)在 throttle 秒内只弹一次,连答多轮不连珠炮;
+        // start 无横幅且要尽快进专注,不节流。会话进出集合在 PetView 内做,不受此影响。
+        if phase != "start" {
+            let throttleKey = "\(phase)|\(tool)|\(cwd ?? "")"
+            let now = Date()
+            if let last = lastTaskDoneAt[throttleKey], now.timeIntervalSince(last) < AppDelegate.taskDoneThrottle {
+                PetView.log("陪跑提示节流(\(Int(AppDelegate.taskDoneThrottle))s 内重复),跳过 \(url.absoluteString)")
+                return
+            }
+            lastTaskDoneAt[throttleKey] = now
         }
-        lastTaskDoneAt[throttleKey] = now
-        let message = AppDelegate.taskDoneMessage(tool: tool, cwd: cwd, task: task)
-        PetView.log("收到完成通知 \(url.absoluteString) → \(message)")
-        petView?.showTaskDoneHint(message: message)
+        let message = AppDelegate.companionMessage(phase: phase, tool: tool, cwd: cwd, task: task)
+        PetView.log("陪跑事件 \(url.absoluteString) → [\(phase)] \(message)")
+        petView?.handleCompanionEvent(phase: phase, sid: sid, message: message)
     }
 
     /// 据工具名与工作目录拼报喜文案。抽成静态纯函数,便于 --notify-dryrun 离线核对。
@@ -2020,6 +2416,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         return who.isEmpty ? "答完了,该主公了" : "\(who) 答完了,该主公了"
+    }
+
+    /// 据相位拼陪跑横幅文案。done 复用 taskDoneMessage(含任务简介);start/waiting 用目录名。抽静态纯函数便于 --notify-dryrun 离线核对。
+    static func companionMessage(phase: String, tool: String, cwd: String?, task: String?) -> String {
+        let who: String
+        switch tool.lowercased() {
+        case "codex", "cx": who = "Codex"
+        case "claude", "cc": who = "Claude"
+        default: who = tool
+        }
+        let dir: String? = cwd.flatMap {
+            let n = ($0 as NSString).lastPathComponent
+            return (!n.isEmpty && n != "/") ? n : nil
+        }
+        switch phase {
+        case "start":
+            let w = who.isEmpty ? "开工了" : "\(who) 开工了"
+            return dir.map { "\(w) · \($0)" } ?? w
+        case "waiting":
+            let w = who.isEmpty ? "在等点头" : "\(who) 在等主公点头"
+            return dir.map { "\(w) · \($0)" } ?? w
+        default:
+            return taskDoneMessage(tool: tool, cwd: cwd, task: task)
+        }
     }
 }
 
@@ -2142,9 +2562,12 @@ MainActor.assumeIsolated {
         let tool = items.first { $0.name == "tool" }?.value ?? ""
         let cwd = items.first { $0.name == "cwd" || $0.name == "dir" }?.value
         let task = items.first { $0.name == "task" }?.value
-        print("scheme=\(url.scheme ?? "(无)") action=\(url.host ?? components?.host ?? "(无)")")
-        print("tool=\(tool.isEmpty ? "(空)" : tool) cwd=\(cwd ?? "(无)") task=\(task ?? "(无)")")
-        print("横幅文案:\(AppDelegate.taskDoneMessage(tool: tool, cwd: cwd, task: task))")
+        let phase = url.host ?? components?.host ?? ""
+        let sid = items.first { $0.name == "sid" }?.value
+        print("scheme=\(url.scheme ?? "(无)") phase=\(phase.isEmpty ? "(无)" : phase)")
+        print("tool=\(tool.isEmpty ? "(空)" : tool) sid=\(sid ?? "(无)") cwd=\(cwd ?? "(无)") task=\(task ?? "(无)")")
+        let normalizedPhase = ["start", "waiting", "done"].contains(phase) ? phase : "done"
+        print("横幅文案:\(AppDelegate.companionMessage(phase: normalizedPhase, tool: tool, cwd: cwd, task: task))")
         exit(0)
     }
 
