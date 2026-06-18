@@ -10,6 +10,8 @@ private enum Style {
     static let mouth = NSColor(srgbRed: 0x5A / 255.0, green: 0x2A / 255.0, blue: 0x1C / 255.0, alpha: 1.0)
     /// 呼吸完整周期(秒):一次缩放的吸→呼
     static let breathPeriod: Double = 6
+    /// 眼睛方向刷新周期(秒):只重绘 90pt 小图,20fps 足够顺滑且开销可控
+    static let eyeFollowPeriod: TimeInterval = 1.0 / 20.0
     /// 窗口边长(点)
     static let windowSize: CGFloat = 90
 }
@@ -22,18 +24,34 @@ final class PetView: NSView {
     private var snapshotBackground = false
     /// 离屏快照时的张嘴幅度(0=闭嘴),便于自测渲染“吃”的一帧
     private var snapshotMouthOpen: CGFloat = 0
+    /// 离屏快照时的眼睛偏移方向,复用原图两个深色空位做眼睛
+    private var snapshotEyeLook = CGVector(dx: 0, dy: 0)
+    /// 离屏快照时的眼形(睁/闭/弯月笑),核对眨眼与眯眼笑的渲染
+    private var snapshotEyeMode: EyeMode = .normal
     /// 承载星星图标并接受呼吸动画的图层
     private let iconLayer = CALayer()
-    /// 预渲染的两帧:闭嘴(常态)与张嘴(进食),拖放时在二者间切换出“咀嚼”
-    private var closedFrame: CGImage?
-    private var openFrame: CGImage?
-    /// 咀嚼定时器(.common 模式,确保拖放进行中仍触发)与当前嘴态
+    /// 单一外观状态:嘴张幅(0~1)、眼神偏移、眼形(睁/闭/弯月笑)。任何动作改这几个值后调 render() 即刻重绘。
+    /// 不再预渲染多帧——表情维度一多,组合会爆炸;统一一处出图反而更省、更清晰。
+    private var mouthOpen: CGFloat = 0
+    private var eyeLook = CGVector(dx: 0, dy: 0)
+    private var eyeMode: EyeMode = .normal
+    /// 咀嚼定时器(.common 模式,确保拖放进行中仍触发)
     private var chewTimer: Timer?
-    private var mouthIsOpen = false
     /// 快捷键投喂的"一口"收尾计时:拖放靠松手/离开收尾,快捷键没有拖放过程,故定时自动闭嘴
     private var biteTimer: Timer?
+    /// 眼睛跟随鼠标方向的刷新定时器
+    private var eyeTimer: Timer?
+    /// 空闲动作调度定时器:久无操作时偶发眨眼/哈欠/摇晃/东张西望
+    private var idleTimer: Timer?
+    /// 眼睛被空闲动作(眨眼/东张西望)临时接管:置位时 eyeFollow 让路,不把眼神拉回鼠标
+    private var idleEyeActive = false
+    /// 鼠标悬停中:悬停期间换放大版呼吸 + 眯眼笑 + 发光,并暂停空闲打扰
+    private var isHovering = false
     /// 扑食动作进行中标志:防连按时把"归位坐标"记成动画途中的中间值
     private var isPouncing = false
+
+    /// 眼形三态:统一驱动眨眼(closed)、哈欠闭眼(closed)、眯眼笑(happy)。normal 时才随鼠标偏移。
+    enum EyeMode { case normal, closed, happy }
 
     /// Claude 星芒的方块拼图(取自 Claude Code 欢迎界面),逐字符按象限自绘,严丝合缝
     private static let starArt = [
@@ -45,6 +63,10 @@ final class PetView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
+        // 只让 iconLayer 这一份显示内容:禁止 AppKit 自动把 draw(_:) 画进背衬层,
+        // 否则背衬层会多画一份星芒,跳/摇时 iconLayer 移开就露出"第二个身体"。
+        // 离屏快照走显式 view.draw(_:) 调用,不受此策略影响。
+        layerContentsRedrawPolicy = .never
         layer?.masksToBounds = false
         setupIconLayer(scale: NSScreen.main?.backingScaleFactor ?? 2)
         registerForDraggedTypes([.fileURL]) // 接住拖入的文件,投喂给 claude 分析
@@ -60,46 +82,88 @@ final class PetView: NSView {
         iconLayer.position = CGPoint(x: bounds.midX, y: bounds.midY)
         iconLayer.contentsGravity = .resizeAspect // 保持图标比例
         iconLayer.contentsScale = scale
-        // 预渲染常态/进食两帧,拖放时无需实时绘制即可切换
-        closedFrame = Self.starImage(size: bounds.size).cgImage(forProposedRect: nil, context: nil, hints: nil)
-        openFrame = Self.starImage(size: bounds.size, mouthOpen: 1).cgImage(forProposedRect: nil, context: nil, hints: nil)
-        iconLayer.contents = closedFrame
         layer?.addSublayer(iconLayer)
+        applyBaseShadow() // 常驻淡落地阴影,替代被关掉的窗口阴影
+        render() // 画出初始常态帧
     }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         guard let window else { return }
         iconLayer.contentsScale = window.backingScaleFactor // 适配真实屏幕缩放,保证清晰
-        startAnimations()
+        render()              // 缩放确定后重绘一帧,保证清晰
+        startBreathing()
+        startEyeFollow()
+        scheduleIdle()        // 启动空闲动作调度
     }
 
-    // MARK: 动画(交给 Core Animation,无需逐帧重绘)
-    private func startAnimations() {
-        guard iconLayer.animation(forKey: "breathe") == nil else { return }
-        // 呼吸:在 0.95 ~ 1.0 间缓入缓出地缩放,幅度小、节奏慢,安静不抢眼
+    // MARK: 呼吸动画(交给 Core Animation,无需逐帧重绘)
+    // 常态在 0.95~1.0 间缓缓缩放;悬停时换成放大区间(见 onHoverBegin),呼吸不停、只是"鼓"起来。
+    private func startBreathing(scaleLow: CGFloat = 0.95, scaleHigh: CGFloat = 1.0) {
         let breathe = CABasicAnimation(keyPath: "transform.scale")
-        breathe.fromValue = 0.95
-        breathe.toValue = 1.0
+        breathe.fromValue = scaleLow
+        breathe.toValue = scaleHigh
         breathe.duration = Style.breathPeriod / 2
         breathe.autoreverses = true
         breathe.repeatCount = .infinity
         breathe.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-        iconLayer.add(breathe, forKey: "breathe")
+        iconLayer.add(breathe, forKey: "breathe") // 同 key 重加即替换,实现常态↔放大切换
+    }
+
+    // MARK: 眼睛跟随鼠标方向
+    // 不新增眼睛素材;只把原图中上部两个深色空位当眼睛,随鼠标方向在原位附近轻微挪动。
+    private func startEyeFollow() {
+        guard eyeTimer == nil else { return }
+        updateEyeLookFromMouse()
+        let timer = Timer(timeInterval: Style.eyeFollowPeriod, repeats: true) { [weak self] _ in
+            self?.updateEyeLookFromMouse()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        eyeTimer = timer
+    }
+
+    private func updateEyeLookFromMouse() {
+        guard let window else {
+            eyeTimer?.invalidate()
+            eyeTimer = nil
+            return
+        }
+        guard !idleEyeActive, !isHovering else { return } // 东张西望/眨眼/悬停接管眼睛时让路,不与之抢
+        let center = CGPoint(x: window.frame.midX, y: window.frame.midY)
+        let mouse = NSEvent.mouseLocation
+        let dx = mouse.x - center.x
+        let dy = mouse.y - center.y
+        let distance = hypot(dx, dy)
+        let nextLook: CGVector
+        if distance < 8 {
+            nextLook = CGVector(dx: 0, dy: 0)
+        } else {
+            let strength = min(distance / 140, 1)
+            nextLook = CGVector(dx: dx / distance * strength, dy: dy / distance * strength)
+        }
+        guard abs(nextLook.dx - eyeLook.dx) > 0.02 || abs(nextLook.dy - eyeLook.dy) > 0.02 else { return }
+        eyeLook = nextLook
+        render()
+    }
+
+    /// 按当前外观状态(嘴/眼神/眼形)出一帧并送入图层。所有动作改完状态后都走这里,单一出图口径。
+    private func render() {
+        let image = Self.starImage(size: bounds.size, mouthOpen: mouthOpen, eyeLook: eyeLook, eyeMode: eyeMode)
+        setFrame(image.cgImage(forProposedRect: nil, context: nil, hints: nil))
     }
 
     // MARK: 进食动画:拖入文件时张嘴咀嚼,离开/吃下即闭嘴
     // 用 Timer(.common 模式)手动切帧:拖放期间 runloop 处于 eventTracking,
     // 普通定时器与部分隐式动画不会触发,.common 才能保证“嚼”起来。
     private func startEating() {
-        Self.log("startEating closed=\(closedFrame != nil) open=\(openFrame != nil)")
+        Self.log("startEating")
         guard chewTimer == nil else { return }
-        mouthIsOpen = true
-        setFrame(openFrame)                              // 立即张嘴,给即时反馈
+        mouthOpen = 1
+        render()                                         // 立即张嘴,给即时反馈
         let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
             guard let self else { return }
-            self.mouthIsOpen.toggle()
-            self.setFrame(self.mouthIsOpen ? self.openFrame : self.closedFrame)
+            self.mouthOpen = self.mouthOpen > 0 ? 0 : 1  // 在张/闭间切换,切出"咀嚼"
+            self.render()
         }
         RunLoop.main.add(timer, forMode: .common)
         chewTimer = timer
@@ -108,7 +172,8 @@ final class PetView: NSView {
     private func stopEating() {
         chewTimer?.invalidate()
         chewTimer = nil
-        setFrame(closedFrame)                            // 复位到闭嘴常态
+        mouthOpen = 0
+        render()                                         // 复位到闭嘴常态
     }
 
     // MARK: 快捷键投喂:原地"吃一口"
@@ -119,11 +184,148 @@ final class PetView: NSView {
         biteTimer?.invalidate()                          // 重置收尾计时,支持连按顺延
         let timer = Timer(timeInterval: 1.0, repeats: false) { [weak self] _ in
             self?.stopEating()
-            self?.setFeedGlow(false)
+            self?.setFeedGlow(self?.isHovering == true) // 悬停中则保留发光,否则熄灭
             self?.biteTimer = nil
         }
         RunLoop.main.add(timer, forMode: .common)
         biteTimer = timer
+    }
+
+    // MARK: 鼠标悬停互动
+    // 借 NSTrackingArea 捕获进/出。.activeAlways 让附件应用(非前台)也能收到 hover。
+    // 悬停期间:开心跳一下 + 放大版呼吸 + 眯眼笑 + 发光,并暂停空闲打扰;移出即复位。
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea) // 尺寸变化时重建,避免叠加多个
+        addTrackingArea(NSTrackingArea(
+            rect: bounds,
+            options: [.activeAlways, .mouseEnteredAndExited, .inVisibleRect],
+            owner: self
+        ))
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        guard !isHovering else { return }
+        isHovering = true
+        eyeMode = .happy                 // 眯眼笑
+        render()
+        setFeedGlow(true)                // 点亮橙光
+        startBreathing(scaleLow: 1.08, scaleHigh: 1.18) // 鼓起来:放大版呼吸
+        jump()                           // 开心蹦一下
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        guard isHovering else { return }
+        isHovering = false
+        eyeMode = .normal
+        render()
+        if chewTimer == nil { setFeedGlow(false) } // 进食中则交给进食收尾,避免抢着熄灯
+        startBreathing()                 // 复位常态呼吸
+    }
+
+    // MARK: 点击互动
+    // 用 mouseUp 触发"吃一口",不 override mouseDown,保留 isMovableByWindowBackground 整窗拖拽。
+    override func mouseUp(with event: NSEvent) {
+        eatBite()
+    }
+
+    // MARK: 图层小动作(只动 transform,不动窗口)
+    // 跳/摇晃/伸懒腰都改图层 transform 的不同分量:窗口不动,鼠标 hover 跟踪稳定,且与呼吸(scale)分量叠加不冲突。
+
+    /// 开心跳一下:transform.translation.y 抛物线起落一次(正 y 向上)。
+    private func jump() {
+        let j = CAKeyframeAnimation(keyPath: "transform.translation.y")
+        j.values = [0, Style.windowSize * 0.16, 0]
+        j.keyTimes = [0, 0.4, 1]
+        j.timingFunctions = [CAMediaTimingFunction(name: .easeOut), CAMediaTimingFunction(name: .easeIn)]
+        j.duration = 0.45
+        iconLayer.add(j, forKey: "jump")
+    }
+
+    /// 左右摇晃:transform.rotation.z 来回摆几下(弧度),与呼吸 scale 互不干扰。
+    private func sway() {
+        let s = CAKeyframeAnimation(keyPath: "transform.rotation.z")
+        s.values = [0, 0.12, -0.10, 0.07, -0.04, 0]
+        s.keyTimes = [0, 0.18, 0.42, 0.64, 0.84, 1]
+        s.duration = 1.1
+        s.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        iconLayer.add(s, forKey: "sway")
+    }
+
+    /// 打哈欠/伸懒腰:闭眼 + 张嘴一阵,同时纵向(scale.y)缓缓拉伸再收回。
+    /// 纵向拉伸用 transform.scale.y,与呼吸的 transform.scale 是不同 keyPath,可叠加合成不互相覆盖。
+    private func yawn() {
+        guard chewTimer == nil else { return } // 正在嚼就不哈欠,免得抢嘴
+        eyeMode = .closed
+        mouthOpen = 1
+        render()
+        let stretch = CAKeyframeAnimation(keyPath: "transform.scale.y")
+        stretch.values = [1.0, 1.12, 1.12, 1.0]
+        stretch.keyTimes = [0, 0.3, 0.7, 1]
+        stretch.duration = 1.0
+        stretch.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        iconLayer.add(stretch, forKey: "yawn")
+        let done = Timer(timeInterval: 1.0, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            self.mouthOpen = 0
+            self.eyeMode = self.isHovering ? .happy : .normal
+            self.render()
+        }
+        RunLoop.main.add(done, forMode: .common)
+    }
+
+    /// 眨一下眼:闭眼极短再睁开;空闲期间偶发,接管眼睛防 eyeFollow 抢渲染。
+    private func blink() {
+        guard eyeMode == .normal else { return } // 笑眼/闭眼时不叠加
+        idleEyeActive = true
+        eyeMode = .closed
+        render()
+        let open = Timer(timeInterval: 0.13, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            self.eyeMode = .normal
+            self.render()
+            self.idleEyeActive = false
+        }
+        RunLoop.main.add(open, forMode: .common)
+    }
+
+    /// 东张西望:接管眼睛,依次随机看几个方向,结束后交还鼠标跟随。
+    private func lookAround() {
+        guard eyeMode == .normal, !idleEyeActive else { return }
+        idleEyeActive = true
+        let dirs = [CGVector(dx: -0.9, dy: 0.2), CGVector(dx: 0.9, dy: 0.1),
+                    CGVector(dx: 0.2, dy: -0.8), CGVector(dx: -0.5, dy: 0.6)].shuffled()
+        let picks = Array(dirs.prefix(3))
+        for (i, dir) in picks.enumerated() {
+            let t = Timer(timeInterval: 0.45 * Double(i), repeats: false) { [weak self] _ in
+                self?.eyeLook = dir
+                self?.render()
+            }
+            RunLoop.main.add(t, forMode: .common)
+        }
+        let end = Timer(timeInterval: 0.45 * Double(picks.count) + 0.3, repeats: false) { [weak self] _ in
+            self?.idleEyeActive = false // 交还鼠标跟随,eyeFollow 会平滑拉回
+        }
+        RunLoop.main.add(end, forMode: .common)
+    }
+
+    // MARK: 空闲动作调度
+    // 久无操作时每隔几秒随机挑一个小动作;但 hover/进食/扑食/眼睛被接管时一律让路,不打扰交互。
+    private func scheduleIdle() {
+        idleTimer?.invalidate()
+        let delay = Double.random(in: 5...11)
+        let t = Timer(timeInterval: delay, repeats: false) { [weak self] _ in
+            self?.performRandomIdle()
+            self?.scheduleIdle()
+        }
+        RunLoop.main.add(t, forMode: .common)
+        idleTimer = t
+    }
+
+    private func performRandomIdle() {
+        guard !isHovering, !isPouncing, chewTimer == nil, biteTimer == nil, !idleEyeActive else { return }
+        let actions = [blink, blink, lookAround, sway, yawn] // blink 权重高些,最自然
+        actions.randomElement()?()
     }
 
     // MARK: 快捷键投喂:扑食动作
@@ -192,24 +394,27 @@ final class PetView: NSView {
     }
 
     /// 标记为离屏快照模式(铺深色底),供 renderSnapshot 直接调用 draw 使用
-    func prepareSnapshot(withBackground: Bool, mouthOpen: CGFloat = 0) {
+    func prepareSnapshot(withBackground: Bool, mouthOpen: CGFloat = 0, eyeLook: CGVector = CGVector(dx: 0, dy: 0), eyeMode: EyeMode = .normal) {
         snapshotBackground = withBackground
         snapshotMouthOpen = mouthOpen
+        snapshotEyeLook = eyeLook
+        snapshotEyeMode = eyeMode
     }
 
     // MARK: 绘制(仅离屏快照走此路径;运行时由图层显示)
     override func draw(_ dirtyRect: NSRect) {
+        guard snapshotBackground else { return } // 运行时只允许 iconLayer 显示,避免背衬层留下第二份静止星芒
         if snapshotBackground, let ctx = NSGraphicsContext.current?.cgContext {
             ctx.setFillColor(NSColor(srgbRed: 0x1E / 255.0, green: 0x1E / 255.0, blue: 0x1E / 255.0, alpha: 1).cgColor)
             ctx.fill(bounds)
         }
-        Self.starImage(size: bounds.size, mouthOpen: snapshotMouthOpen).draw(in: bounds) // NSImage 自动处理坐标翻转
+        Self.starImage(size: bounds.size, mouthOpen: snapshotMouthOpen, eyeLook: snapshotEyeLook, eyeMode: snapshotEyeMode).draw(in: bounds) // NSImage 自动处理坐标翻转
     }
 
     // MARK: 星星图标渲染
     /// 把 starArt 的方块字符逐个按 2×2 象限自绘成星芒:不走字体、直接填充矩形,
     /// 故无字体拼接缝隙,能严丝合缝还原终端里的样子;cell 取瘦高比例,呼应终端字符格。
-    private static func starImage(size: CGSize, mouthOpen: CGFloat = 0) -> NSImage {
+    private static func starImage(size: CGSize, mouthOpen: CGFloat = 0, eyeLook: CGVector = CGVector(dx: 0, dy: 0), eyeMode: EyeMode = .normal) -> NSImage {
         let image = NSImage(size: size)
         image.lockFocus()
         defer { image.unlockFocus() }
@@ -239,6 +444,9 @@ final class PetView: NSView {
             }
         }
 
+        moveBuiltInEyeHoles(ctx, size: size, originX: originX, originY: originY,
+                            cellW: cellW, cellH: cellH, look: eyeLook, mode: eyeMode)
+
         // 进食态:在脸部中下方画一张暗色横口,开合幅度由 mouthOpen 决定(0 则无嘴)
         if mouthOpen > 0 {
             let mouthWidth = cellW * 3.2
@@ -253,6 +461,78 @@ final class PetView: NSView {
             ctx.fill(mouthRect)
         }
         return image
+    }
+
+    /// 复用原图里的两个深色竖向空位作为眼睛:先补回原空位(铺橙),再按眼形清出对应深色形状。
+    /// normal=竖洞(随 look 偏移)、closed=水平细缝(眨眼/哈欠)、happy=上凸弯月(眯眼笑)。
+    /// 没有新增眼睛素材,只是让原本两个空位变形/移动。
+    private static func moveBuiltInEyeHoles(_ ctx: CGContext, size: CGSize,
+                                            originX: CGFloat, originY: CGFloat,
+                                            cellW: CGFloat, cellH: CGFloat,
+                                            look: CGVector, mode: EyeMode) {
+        let lookX = max(-1, min(1, look.dx))
+        let lookY = max(-1, min(1, look.dy))
+        let holeSize = CGSize(width: cellW * 0.56, height: cellH * 0.56)
+        let patchSize = CGSize(width: cellW * 0.9, height: cellH * 0.62)
+        let travelX = cellW * 0.18
+        let travelY = cellH * 0.12
+        let eyeY = originY + cellH * 2.22
+        let centers = [
+            CGPoint(x: size.width / 2 - cellW * 1.5, y: eyeY),
+            CGPoint(x: size.width / 2 + cellW * 1.5, y: eyeY),
+        ]
+
+        // 先铺橙补回原本两个空位,后续再按眼形清出深色洞
+        ctx.setFillColor(Style.orange.cgColor)
+        for center in centers {
+            let original = CGRect(
+                x: center.x - patchSize.width / 2,
+                y: center.y - patchSize.height / 2,
+                width: patchSize.width,
+                height: patchSize.height
+            )
+            ctx.fill(original)
+        }
+
+        switch mode {
+        case .normal:
+            // 睁眼:挖竖向空位,随鼠标方向在原位附近轻移
+            for center in centers {
+                let moved = CGRect(
+                    x: center.x + travelX * lookX - holeSize.width / 2,
+                    y: center.y + travelY * lookY - holeSize.height / 2,
+                    width: holeSize.width,
+                    height: holeSize.height
+                )
+                ctx.clear(moved)
+            }
+        case .closed:
+            // 闭眼:挖一条水平细缝(眨眼/哈欠时用)。clear 混合模式可清出任意描边形状为透明
+            ctx.setBlendMode(.clear)
+            ctx.setLineCap(.round)
+            ctx.setLineWidth(cellH * 0.16)
+            for center in centers {
+                let half = holeSize.width * 0.7
+                ctx.beginPath()
+                ctx.move(to: CGPoint(x: center.x - half, y: center.y))
+                ctx.addLine(to: CGPoint(x: center.x + half, y: center.y))
+                ctx.strokePath()
+            }
+            ctx.setBlendMode(.normal)
+        case .happy:
+            // 眯眼笑:挖两道上凸弯月(⌒ ⌒)。上半圆弧凸向 +y(屏幕上方),即开心的笑眼
+            ctx.setBlendMode(.clear)
+            ctx.setLineCap(.round)
+            ctx.setLineWidth(cellH * 0.16)
+            let r = holeSize.width * 0.8
+            for center in centers {
+                ctx.beginPath()
+                ctx.addArc(center: CGPoint(x: center.x, y: center.y - r * 0.35), radius: r,
+                           startAngle: .pi * 0.18, endAngle: .pi * 0.82, clockwise: false)
+                ctx.strokePath()
+            }
+            ctx.setBlendMode(.normal)
+        }
     }
 
     /// 终端块元素字符 → 2×2 象限填充开关 (左上, 右上, 左下, 右下)
@@ -323,12 +603,25 @@ final class PetView: NSView {
         return true
     }
 
-    /// 拖入时点亮橙色光晕,松手/离开即熄灭;借图层阴影实现,不与呼吸缩放打架
+    /// 拖入/悬停时点亮橙色光晕,熄灭时回落到常驻淡阴影;借图层阴影实现,随 transform 动画一起动,不与呼吸缩放打架
     private func setFeedGlow(_ on: Bool) {
-        iconLayer.shadowColor = Style.orange.cgColor
-        iconLayer.shadowRadius = 12
-        iconLayer.shadowOffset = .zero
-        iconLayer.shadowOpacity = on ? 0.9 : 0
+        if on {
+            iconLayer.shadowColor = Style.orange.cgColor
+            iconLayer.shadowRadius = 12
+            iconLayer.shadowOffset = .zero
+            iconLayer.shadowOpacity = 0.9
+        } else {
+            applyBaseShadow()
+        }
+    }
+
+    /// 常驻淡落地阴影:替代窗口级 hasShadow(后者在图层 transform 动画时会残留出"第二个"重影)。
+    /// 图层阴影跟随图层一起平移/旋转/缩放,跳跳摇摇都不留残影。
+    private func applyBaseShadow() {
+        iconLayer.shadowColor = NSColor.black.cgColor
+        iconLayer.shadowRadius = 5
+        iconLayer.shadowOffset = CGSize(width: 0, height: -3) // 影子落在正下方(图层 y 向上,故取负)
+        iconLayer.shadowOpacity = 0.35
     }
 
     private func canAcceptFiles(_ sender: NSDraggingInfo) -> Bool {
@@ -553,7 +846,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         win.isOpaque = false
         win.backgroundColor = .clear
-        win.hasShadow = true // 圆角方块图标投下自然阴影,像停在桌面上
+        // 刻意不用窗口级 hasShadow:它由系统按窗口位图生成,不跟随图层 transform 动画刷新,
+        // 桌宠一跳/一摇旧阴影会残留成"第二个"重影。改用图层自带阴影(applyBaseShadow),随 transform 一起动。
+        win.hasShadow = false
         win.level = .floating // 浮在普通窗口之上
         // 跨所有桌面/空间显示,并能浮在全屏应用之上
         win.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
@@ -578,10 +873,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 // MARK: - 离屏渲染自测
 // 不依赖屏幕、不触碰桌面隐私,把一帧图标渲染成 PNG,供本地核对外观。
 @MainActor
-private func renderSnapshot(to path: String, mouthOpen: CGFloat = 0) {
+private func renderSnapshot(to path: String, mouthOpen: CGFloat = 0, eyeLook: CGVector = CGVector(dx: 0, dy: 0), eyeMode: PetView.EyeMode = .normal) {
     let dim: CGFloat = 256
     let view = PetView(frame: NSRect(x: 0, y: 0, width: dim, height: dim))
-    view.prepareSnapshot(withBackground: true, mouthOpen: mouthOpen)
+    view.prepareSnapshot(withBackground: true, mouthOpen: mouthOpen, eyeLook: eyeLook, eyeMode: eyeMode)
 
     let image = NSImage(size: NSSize(width: dim, height: dim))
     image.lockFocus()
@@ -618,6 +913,29 @@ MainActor.assumeIsolated {
         // 自测模式:渲染“张嘴进食”的一帧后退出,核对嘴的位置与大小
         let out = idx + 1 < arguments.count ? arguments[idx + 1] : "/tmp/claudepet-eat.png"
         renderSnapshot(to: out, mouthOpen: 1)
+        exit(0)
+    }
+
+    if let idx = arguments.firstIndex(of: "--render-look") {
+        // 自测模式:指定原图两个空位的偏移方向后渲染一帧,用法:--render-look [out.png] [dx] [dy]
+        let out = idx + 1 < arguments.count ? arguments[idx + 1] : "/tmp/claudepet-look.png"
+        let dx = idx + 2 < arguments.count ? Double(arguments[idx + 2]) ?? 0 : 1
+        let dy = idx + 3 < arguments.count ? Double(arguments[idx + 3]) ?? 0 : 0
+        renderSnapshot(to: out, eyeLook: CGVector(dx: dx, dy: dy))
+        exit(0)
+    }
+
+    if let idx = arguments.firstIndex(of: "--render-blink") {
+        // 自测模式:渲染"闭眼"一帧(眨眼/哈欠时的眼形),核对水平细缝位置
+        let out = idx + 1 < arguments.count ? arguments[idx + 1] : "/tmp/claudepet-blink.png"
+        renderSnapshot(to: out, eyeMode: .closed)
+        exit(0)
+    }
+
+    if let idx = arguments.firstIndex(of: "--render-happy") {
+        // 自测模式:渲染"眯眼笑"一帧(弯月眼),核对悬停互动的笑脸
+        let out = idx + 1 < arguments.count ? arguments[idx + 1] : "/tmp/claudepet-happy.png"
+        renderSnapshot(to: out, eyeMode: .happy)
         exit(0)
     }
 
