@@ -1614,7 +1614,7 @@ final class PetView: NSView {
         // 交互 shell 通常已含 Homebrew 路径,再查常见绝对路径;缺失时给可见提示,避免执行不存在的文件。
         return """
         #!/bin/zsh
-        # ClaudePet feed script v3: codex 快捷键固定调用 cx
+        # ClaudePet feed script v4: 投喂先用 cc/cx 包装(官方命令+跳过确认),没有再退官方 claude/codex
         cd \(shellQuoted(workingDir)) || exit 1
         TOOL=""
         for candidate in \(toolCandidates); do
@@ -1646,30 +1646,38 @@ enum FeedTool {
     case claude
     case codex
 
-    /// 终端 PATH 里依次尝试的命令名;⌥⌘X 按主公要求固定调用 cx,不兜底 codex。
+    /// PATH 里先试的命令名:cc/cx 是主公"官方命令 + 跳过确认参数"的别名。但投喂脚本是非交互 shell、
+    /// 取不到 alias,这一步通常落空,真正生效的是 fallbackPaths 里的同名内置包装脚本。
     var commands: [String] {
         switch self {
-        case .claude: return ["claude"]
+        case .claude: return ["cc"]
         case .codex:  return ["cx"]
         }
     }
 
-    /// PATH 找不到时尝试的常见绝对路径(Homebrew arm64 与 Intel 前缀)。
+    /// 绝对路径兜底,按优先级:先桌宠内置的 cc/cx 包装脚本(= 官方命令 + 跳过确认参数),
+    /// 没有再退到官方 claude/codex —— 即主公要的"先 cc/cx,没有再 claude/codex"。
     func fallbackPaths(relativeTo appBundleURL: URL) -> [String] {
+        let resources = appBundleURL
+            .appendingPathComponent("Contents")
+            .appendingPathComponent("Resources")
         switch self {
         case .claude:
-            return ["/opt/homebrew/bin/claude", "/usr/local/bin/claude"]
+            return [resources.appendingPathComponent("cc").path,
+                    "/opt/homebrew/bin/claude", "/usr/local/bin/claude"]
         case .codex:
-            let bundledCx = appBundleURL
-                .appendingPathComponent("Contents")
-                .appendingPathComponent("Resources")
-                .appendingPathComponent("cx")
-                .path
-            return ["/opt/homebrew/bin/cx", "/usr/local/bin/cx", bundledCx]
+            return [resources.appendingPathComponent("cx").path,
+                    "/opt/homebrew/bin/codex", "/usr/local/bin/codex"]
         }
     }
-    /// 日志/提示用名
-    var label: String { commands.joined(separator: "/") }
+
+    /// 日志/提示用名:体现"包装命令优先、官方命令兜底"
+    var label: String {
+        switch self {
+        case .claude: return "cc/claude"
+        case .codex:  return "cx/codex"
+        }
+    }
 }
 
 // MARK: - 全局热键

@@ -68,7 +68,12 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 PLIST
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
-echo "==> 写入 cx 包装命令"
+echo "==> 写入 cc / cx 包装命令(投喂优先用它们 = 官方命令 + 跳过确认参数,对应主公的 cc/cx 别名)"
+cat > "$RESOURCES/cc" <<'SH'
+#!/usr/bin/env zsh
+exec /opt/homebrew/bin/claude --dangerously-skip-permissions "$@"
+SH
+chmod +x "$RESOURCES/cc"
 cat > "$RESOURCES/cx" <<'SH'
 #!/usr/bin/env zsh
 exec /opt/homebrew/bin/codex --dangerously-bypass-approvals-and-sandbox "$@"

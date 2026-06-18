@@ -71,7 +71,7 @@ open ClaudePet.app         # 启动桌宠
 
 - `Resources/claude-icon.png` **运行时并不加载**——星芒是纯代码绘制的，该 PNG 仅作参考图存放，别误以为是图标资源。
 - `PetView.log(_:)` 向 `/tmp/claudepet.log` 追加诊断日志，源码注明是**临时**手段；清理时连同各 `Self.log(...)` 调用一并移除。
-- 投喂功能依赖 `claude`（⌥⌘C / 拖放）或 `cx`（⌥⌘X）CLI 在 PATH 上；脚本会兜底检查 `/opt/homebrew/bin/` 与 `/usr/local/bin/` 的常见安装路径。Ghostty 为可选增强，缺失不影响。
+- 投喂优先用桌宠**内置的 `cc`/`cx` 包装脚本**（`build.sh` 生成:`Resources/cc` = `claude --dangerously-skip-permissions`、`Resources/cx` = `codex --dangerously-bypass-approvals-and-sandbox`,即主公同名 alias 的效果——alias 在非交互投喂脚本里取不到,故用同名包装兜底),没有再退官方 `claude`/`codex`（PATH 或 `/opt/homebrew/bin`、`/usr/local/bin`)。**投喂因此跳过权限确认**(cc/cx 的本质),桌宠喂进去的活儿直接干、不弹确认。Ghostty 为可选增强,缺失不影响。
 - 最低系统 macOS 13.0（`LSMinimumSystemVersion`）。
 - 调外观参数集中在文件顶部的 `Style` 枚举（主色、呼吸周期、窗口边长），优先改这里而非散落的字面量。
 - 任务完成通知靠 `claudepet://` 协议唤起,需把 `hooks/claudepet-notify.sh`(已 `chmod +x`)接进两处**用户级**配置才生效:Claude Code 在 `~/.claude/settings.json` 的 `Stop` 钩子 `command` 填 `<绝对路径>/claudepet-notify.sh claude`;Codex 在 `~/.codex/config.toml`(`notify` 须置于所有 `[表]` 之前,且只认用户级、忽略项目级)填 `notify = ["<绝对路径>/claudepet-notify.sh", "codex"]`。桌宠须在运行中;首次 `open ClaudePet.app` 后 LaunchServices 才登记该协议。`CLAUDEPET_NOTIFY_DRYRUN=1` 跑脚本只打印 URL、不真正唤起,便于核对。
