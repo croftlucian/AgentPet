@@ -3,3 +3,4 @@
 ClaudePet.app/
 .claude/
 *.log
+dist/

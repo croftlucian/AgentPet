@@ -1,54 +1,200 @@
 import AppKit
+import ApplicationServices
 import Carbon.HIToolbox // RegisterEventHotKey 等:注册全局快捷键,无需辅助功能权限
 
 // MARK: - 外观与动画参数
 // 集中放置便于调校,避免散落在各处的“魔法数字”
 private enum Style {
-    /// Claude 标志性赤陶橙 (#D97757),星芒主色
-    static let orange = NSColor(srgbRed: 0xD9 / 255.0, green: 0x77 / 255.0, blue: 0x57 / 255.0, alpha: 1.0)
+    /// 当前星芒主色。手动模式取用户设置,自动模式由桌宠背后的背景采样实时刷新。
+    static var currentPetColor: NSColor = Settings.petColor
+    static var orange: NSColor { currentPetColor }
     /// 张嘴时口腔暗色,压在橙色花瓣上凸显“嘴”
     static let mouth = NSColor(srgbRed: 0x5A / 255.0, green: 0x2A / 255.0, blue: 0x1C / 255.0, alpha: 1.0)
     /// 呼吸完整周期(秒):一次缩放的吸→呼
     static let breathPeriod: Double = 6
     /// 眼睛方向刷新周期(秒):只重绘 90pt 小图,20fps 足够顺滑且开销可控
     static let eyeFollowPeriod: TimeInterval = 1.0 / 20.0
+    /// 环境颜色刷新周期(秒):不截图,只根据系统外观/强调色/前台 App 变化调色
+    static let ambientColorUpdatePeriod: TimeInterval = 1.2
+    /// 微信未读提示轮询周期(秒):只做轻量辅助功能树查询,不读取聊天数据库或消息正文
+    static let weChatNotificationCheckPeriod: TimeInterval = 2.0
     /// 窗口边长(点)
     static let windowSize: CGFloat = 90
+    /// 通知横幅尺寸:窗口额外留出顶部透明区域,平时不显示文字(微信未读 / Claude·Codex 任务完成共用)。
+    /// 高度自适应:短文案=单行(bannerMinHeight),长任务简介自动换行加高,上限 bannerMaxHeight。
+    static let bannerWidth: CGFloat = 210
+    static let bannerMinHeight: CGFloat = 34
+    static let bannerMaxHeight: CGFloat = 116
+    static let bannerGap: CGFloat = 6
+    static var canvasSize: CGSize {
+        CGSize(width: bannerWidth, height: windowSize + bannerGap + bannerMaxHeight)
+    }
+}
+
+// MARK: - 用户设置
+private enum Settings {
+    private static let pounceDurationKey = "pounceDuration"
+    private static let petColorKey = "petColor"
+    private static let autoAdaptColorKey = "autoAdaptColor"
+    private static let receiveWeChatNotificationsKey = "receiveWeChatNotifications"
+    static let defaultPounceDuration: Double = 0.85
+    static let minPounceDuration: Double = 0.35
+    static let maxPounceDuration: Double = 8.0
+    static let defaultPetColor = NSColor(srgbRed: 0xD9 / 255.0, green: 0x77 / 255.0, blue: 0x57 / 255.0, alpha: 1.0)
+    static let defaultAutoAdaptColor = true
+    static let defaultReceiveWeChatNotifications = false
+
+    static var pounceDuration: Double {
+        get {
+            let value = UserDefaults.standard.double(forKey: pounceDurationKey)
+            guard value > 0 else { return defaultPounceDuration }
+            return min(max(value, minPounceDuration), maxPounceDuration)
+        }
+        set {
+            let value = min(max(newValue, minPounceDuration), maxPounceDuration)
+            UserDefaults.standard.set(value, forKey: pounceDurationKey)
+        }
+    }
+
+    static var petColor: NSColor {
+        get {
+            guard let data = UserDefaults.standard.data(forKey: petColorKey),
+                  let color = try? NSKeyedUnarchiver.unarchivedObject(ofClass: NSColor.self, from: data) else {
+                return defaultPetColor
+            }
+            return color.usingColorSpace(.sRGB) ?? defaultPetColor
+        }
+        set {
+            guard let data = try? NSKeyedArchiver.archivedData(withRootObject: newValue, requiringSecureCoding: true) else { return }
+            UserDefaults.standard.set(data, forKey: petColorKey)
+        }
+    }
+
+    static var autoAdaptColor: Bool {
+        get {
+            guard UserDefaults.standard.object(forKey: autoAdaptColorKey) != nil else {
+                return defaultAutoAdaptColor
+            }
+            return UserDefaults.standard.bool(forKey: autoAdaptColorKey)
+        }
+        set {
+            UserDefaults.standard.set(newValue, forKey: autoAdaptColorKey)
+        }
+    }
+
+    static var receiveWeChatNotifications: Bool {
+        get {
+            guard UserDefaults.standard.object(forKey: receiveWeChatNotificationsKey) != nil else {
+                return defaultReceiveWeChatNotifications
+            }
+            return UserDefaults.standard.bool(forKey: receiveWeChatNotificationsKey)
+        }
+        set {
+            UserDefaults.standard.set(newValue, forKey: receiveWeChatNotificationsKey)
+        }
+    }
+
+    /// 任务完成提示开关(Claude/Codex 报喜),缺省开启——这是主动配了 hook 才会用到的功能。
+    private static let receiveTaskDoneNotificationsKey = "receiveTaskDoneNotifications"
+    static var receiveTaskDoneNotifications: Bool {
+        get {
+            guard UserDefaults.standard.object(forKey: receiveTaskDoneNotificationsKey) != nil else { return true }
+            return UserDefaults.standard.bool(forKey: receiveTaskDoneNotificationsKey)
+        }
+        set { UserDefaults.standard.set(newValue, forKey: receiveTaskDoneNotificationsKey) }
+    }
+
+    /// 泛化的 IM 通知开关读写(微信/飞书共用),按 UserDefaults 键存取,缺省关闭。
+    static func imNotificationsEnabled(_ key: String) -> Bool {
+        UserDefaults.standard.object(forKey: key) == nil ? false : UserDefaults.standard.bool(forKey: key)
+    }
+
+    static func setIMNotificationsEnabled(_ key: String, _ on: Bool) {
+        UserDefaults.standard.set(on, forKey: key)
+    }
+}
+
+private extension Notification.Name {
+    static let petColorDidChange = Notification.Name("ClaudePet.petColorDidChange")
+    static let autoAdaptColorDidChange = Notification.Name("ClaudePet.autoAdaptColorDidChange")
+    static let weChatNotificationsDidChange = Notification.Name("ClaudePet.weChatNotificationsDidChange")
+}
+
+private extension NSColor {
+    var hexSignature: String {
+        let color = usingColorSpace(.sRGB) ?? self
+        let red = Int(round(color.redComponent * 255))
+        let green = Int(round(color.greenComponent * 255))
+        let blue = Int(round(color.blueComponent * 255))
+        return String(format: "%02X%02X%02X", red, green, blue)
+    }
 }
 
 // MARK: - 宠物视图
 // 按终端象限网格自绘 Claude 星芒(还原 Claude Code 欢迎界面的方块星芒),
 // 交给 Core Animation 做安静的“呼吸”缩放;draw(_:) 仅供离屏快照,运行时由图层显示。
 final class PetView: NSView {
-    /// 离屏快照模式:为透明背景铺深色底,便于肉眼/AI 核对渲染效果
+    /// 离屏快照底色档:深色档模拟深桌面、浅色档模拟亮桌面,用于核对描边轮廓在两种背景下的可见性
+    static let snapshotDarkBackground = NSColor(srgbRed: 0x1E / 255.0, green: 0x1E / 255.0, blue: 0x1E / 255.0, alpha: 1)
+    static let snapshotLightBackground = NSColor(srgbRed: 0xEC / 255.0, green: 0xEC / 255.0, blue: 0xEC / 255.0, alpha: 1)
+    /// 离屏快照模式:为透明背景铺底色,便于肉眼/AI 核对渲染效果
     private var snapshotBackground = false
+    /// 离屏快照所铺底色,默认深色档;--render-test 可切浅色档核对描边在亮背景上的勾边
+    private var snapshotBgColor = PetView.snapshotDarkBackground
     /// 离屏快照时的张嘴幅度(0=闭嘴),便于自测渲染“吃”的一帧
     private var snapshotMouthOpen: CGFloat = 0
     /// 离屏快照时的眼睛偏移方向,复用原图两个深色空位做眼睛
     private var snapshotEyeLook = CGVector(dx: 0, dy: 0)
     /// 离屏快照时的眼形(睁/闭/弯月笑),核对眨眼与眯眼笑的渲染
     private var snapshotEyeMode: EyeMode = .normal
+    /// 离屏快照时的跑步腿相位,用于核对两腿交替摆动
+    private var snapshotRunPhase = 0
     /// 承载星星图标并接受呼吸动画的图层
     private let iconLayer = CALayer()
+    /// 通知横幅:比跳一下更明确,平时完全透明(微信未读 / 任务完成共用)
+    private let bannerLayer = CALayer()
+    private let bannerTextLayer = CATextLayer()
     /// 单一外观状态:嘴张幅(0~1)、眼神偏移、眼形(睁/闭/弯月笑)。任何动作改这几个值后调 render() 即刻重绘。
     /// 不再预渲染多帧——表情维度一多,组合会爆炸;统一一处出图反而更省、更清晰。
     private var mouthOpen: CGFloat = 0
     private var eyeLook = CGVector(dx: 0, dy: 0)
     private var eyeMode: EyeMode = .normal
+    private var runPhase = 0
     /// 咀嚼定时器(.common 模式,确保拖放进行中仍触发)
     private var chewTimer: Timer?
     /// 快捷键投喂的"一口"收尾计时:拖放靠松手/离开收尾,快捷键没有拖放过程,故定时自动闭嘴
     private var biteTimer: Timer?
     /// 眼睛跟随鼠标方向的刷新定时器
     private var eyeTimer: Timer?
+    /// 扑食滑行期间的跑步腿切帧定时器
+    private var runTimer: Timer?
     /// 空闲动作调度定时器:久无操作时偶发眨眼/哈欠/摇晃/东张西望
     private var idleTimer: Timer?
+    /// 自动适应环境色的低频刷新定时器:不走屏幕捕捉,无屏幕录制权限要求
+    private var ambientColorTimer: Timer?
+    private var lastAmbientColorSignature = ""
+    /// IM 未读检测定时器(微信/飞书共用):只读 Dock 角标,不碰聊天数据库或正文
+    private var weChatNotificationTimer: Timer?
+    /// 各 IM 上一次检测到的未读数(键=IMTarget.key);无条目=上次无未读,只在“无→有”或数量变多时提示
+    private var imLastUnread: [String: Int] = [:]
+    /// 通知提示收尾定时器(发光/笑眼复位),微信未读与任务完成共用
+    private var noticeHintTimer: Timer?
+    private var bannerHideTimer: Timer?
+    private var weChatAccessibilityFailureLogged = false
+    private var lastWeChatPermissionHintAt = Date.distantPast
     /// 眼睛被空闲动作(眨眼/东张西望)临时接管:置位时 eyeFollow 让路,不把眼神拉回鼠标
     private var idleEyeActive = false
     /// 鼠标悬停中:悬停期间换放大版呼吸 + 眯眼笑 + 发光,并暂停空闲打扰
     private var isHovering = false
     /// 扑食动作进行中标志:防连按时把"归位坐标"记成动画途中的中间值
     private var isPouncing = false
+
+    private var petFrameInBounds: CGRect {
+        CGRect(x: (bounds.width - Style.windowSize) / 2,
+               y: 0,
+               width: Style.windowSize,
+               height: Style.windowSize)
+    }
 
     /// 眼形三态:统一驱动眨眼(closed)、哈欠闭眼(closed)、眯眼笑(happy)。normal 时才随鼠标偏移。
     enum EyeMode { case normal, closed, happy }
@@ -70,30 +216,73 @@ final class PetView: NSView {
         layer?.masksToBounds = false
         setupIconLayer(scale: NSScreen.main?.backingScaleFactor ?? 2)
         registerForDraggedTypes([.fileURL]) // 接住拖入的文件,投喂给 claude 分析
+        NotificationCenter.default.addObserver(self, selector: #selector(handlePetColorDidChange(_:)), name: .petColorDidChange, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(handleAutoAdaptColorDidChange(_:)), name: .autoAdaptColorDidChange, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(handleWeChatNotificationsDidChange(_:)), name: .weChatNotificationsDidChange, object: nil)
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("不支持 Interface Builder 加载") }
 
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+        ambientColorTimer?.invalidate()
+        weChatNotificationTimer?.invalidate()
+        noticeHintTimer?.invalidate()
+        bannerHideTimer?.invalidate()
+    }
+
     // MARK: 图层装配
     private func setupIconLayer(scale: CGFloat) {
-        iconLayer.frame = bounds
+        iconLayer.frame = petFrameInBounds
         iconLayer.anchorPoint = CGPoint(x: 0.5, y: 0.5) // 绕中心缩放
-        iconLayer.position = CGPoint(x: bounds.midX, y: bounds.midY)
+        iconLayer.position = CGPoint(x: iconLayer.frame.midX, y: iconLayer.frame.midY)
         iconLayer.contentsGravity = .resizeAspect // 保持图标比例
         iconLayer.contentsScale = scale
         layer?.addSublayer(iconLayer)
+        setupBannerLayer(scale: scale)
         applyBaseShadow() // 常驻淡落地阴影,替代被关掉的窗口阴影
         render() // 画出初始常态帧
+    }
+
+    private func setupBannerLayer(scale: CGFloat) {
+        bannerLayer.frame = CGRect(x: (bounds.width - Style.bannerWidth) / 2,
+                                         y: Style.windowSize + Style.bannerGap,
+                                         width: Style.bannerWidth,
+                                         height: Style.bannerMinHeight)
+        bannerLayer.cornerRadius = 8
+        bannerLayer.backgroundColor = NSColor(srgbRed: 0.08, green: 0.09, blue: 0.10, alpha: 0.92).cgColor
+        bannerLayer.borderWidth = 1
+        bannerLayer.borderColor = Style.orange.cgColor // 默认色;每次 showBanner 按通知类型覆盖(微信绿 / 任务橙)
+        bannerLayer.shadowColor = NSColor.black.cgColor
+        bannerLayer.shadowRadius = 8
+        bannerLayer.shadowOpacity = 0.28
+        bannerLayer.shadowOffset = CGSize(width: 0, height: -2)
+        bannerLayer.opacity = 0
+
+        bannerTextLayer.frame = CGRect(x: 12, y: 7, width: Style.bannerWidth - 24, height: 20)
+        bannerTextLayer.contentsScale = scale
+        bannerTextLayer.alignmentMode = .center
+        bannerTextLayer.isWrapped = true            // 长任务简介自动换行,配合 showBanner 测高自适应
+        bannerTextLayer.truncationMode = .end
+        bannerTextLayer.foregroundColor = NSColor.white.cgColor
+        bannerTextLayer.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        bannerTextLayer.fontSize = 13
+        bannerTextLayer.string = ""
+        bannerLayer.addSublayer(bannerTextLayer)
+        layer?.addSublayer(bannerLayer)
     }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         guard let window else { return }
         iconLayer.contentsScale = window.backingScaleFactor // 适配真实屏幕缩放,保证清晰
+        bannerTextLayer.contentsScale = window.backingScaleFactor
         render()              // 缩放确定后重绘一帧,保证清晰
         startBreathing()
         startEyeFollow()
+        updateBackgroundColorSampling()
+        updateWeChatNotificationMonitor()
         scheduleIdle()        // 启动空闲动作调度
     }
 
@@ -148,8 +337,607 @@ final class PetView: NSView {
 
     /// 按当前外观状态(嘴/眼神/眼形)出一帧并送入图层。所有动作改完状态后都走这里,单一出图口径。
     private func render() {
-        let image = Self.starImage(size: bounds.size, mouthOpen: mouthOpen, eyeLook: eyeLook, eyeMode: eyeMode)
+        let image = Self.starImage(size: iconLayer.bounds.size, mouthOpen: mouthOpen, eyeLook: eyeLook, eyeMode: eyeMode, runPhase: runPhase)
         setFrame(image.cgImage(forProposedRect: nil, context: nil, hints: nil))
+    }
+
+    @objc private func handlePetColorDidChange(_ notification: Notification) {
+        if !Settings.autoAdaptColor {
+            Style.currentPetColor = Settings.petColor
+        }
+        render()
+        setFeedGlow(isHovering || chewTimer != nil)
+    }
+
+    @objc private func handleAutoAdaptColorDidChange(_ notification: Notification) {
+        updateBackgroundColorSampling()
+    }
+
+    @objc private func handleWeChatNotificationsDidChange(_ notification: Notification) {
+        updateWeChatNotificationMonitor()
+    }
+
+    // MARK: 环境色自动适应
+    // 不做屏幕捕捉;稳定跟随系统深浅模式与强调色生成鲜艳醒目的主色,可见性由描边轮廓兜底。
+    // 这不是桌宠背后像素的真实颜色,但无需屏幕录制权限,也不会触碰屏幕内容。
+    private func updateBackgroundColorSampling() {
+        if Settings.autoAdaptColor {
+            startAmbientColorAdaptation()
+        } else {
+            stopAmbientColorAdaptation(resetToManualColor: true)
+        }
+    }
+
+    private func startAmbientColorAdaptation() {
+        guard ambientColorTimer == nil else {
+            updateAmbientColorAndApply()
+            return
+        }
+        updateAmbientColorAndApply()
+        let timer = Timer(timeInterval: Style.ambientColorUpdatePeriod, repeats: true) { [weak self] _ in
+            self?.updateAmbientColorAndApply()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        ambientColorTimer = timer
+    }
+
+    private func stopAmbientColorAdaptation(resetToManualColor: Bool) {
+        ambientColorTimer?.invalidate()
+        ambientColorTimer = nil
+        lastAmbientColorSignature = ""
+        guard resetToManualColor else { return }
+        Style.currentPetColor = Settings.petColor
+        render()
+        setFeedGlow(isHovering || chewTimer != nil)
+    }
+
+    private func updateAmbientColorAndApply() {
+        guard Settings.autoAdaptColor else { return }
+        let environment = Self.currentColorEnvironment()
+        guard environment.signature != lastAmbientColorSignature else { return }
+        lastAmbientColorSignature = environment.signature
+        let nextColor = Self.adaptivePetColor(for: environment, manualColor: Settings.petColor)
+        guard Self.colorDistance(nextColor, Style.currentPetColor) > 0.04 else { return }
+        Style.currentPetColor = nextColor
+        render()
+        setFeedGlow(isHovering || chewTimer != nil)
+    }
+
+    private struct ColorEnvironment {
+        let accentColor: NSColor
+        let isDarkAppearance: Bool
+        let signature: String
+    }
+
+    private static func currentColorEnvironment() -> ColorEnvironment {
+        let appearance = NSApp.effectiveAppearance
+        let isDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let accent = NSColor.controlAccentColor.usingColorSpace(.sRGB) ?? Settings.defaultPetColor
+        return ColorEnvironment(
+            accentColor: accent,
+            isDarkAppearance: isDark,
+            signature: "\(isDark)|\(accent.hexSignature)"
+        )
+    }
+
+    /// 自动主色:稳定跟随系统强调色的色相,始终保持鲜艳偏亮,只随系统深浅做轻微微调。
+    /// 不再掺前台 App 名字的随机 hash(那只会让颜色乱跳)、也不再用浅色模式 0.43 的发暗值——
+    /// 真正"看清"靠描边轮廓兜底,这里只负责给一个好看且不撞背景的醒目色。
+    private static func adaptivePetColor(for environment: ColorEnvironment, manualColor: NSColor) -> NSColor {
+        let accent = environment.accentColor.usingColorSpace(.sRGB) ?? environment.accentColor
+        let manual = manualColor.usingColorSpace(.sRGB) ?? defaultManualColor()
+        var accentHue: CGFloat = 0, accentSaturation: CGFloat = 0, accentBrightness: CGFloat = 0
+        var manualHue: CGFloat = 0, manualSaturation: CGFloat = 0, manualBrightness: CGFloat = 0
+        accent.getHue(&accentHue, saturation: &accentSaturation, brightness: &accentBrightness, alpha: nil)
+        manual.getHue(&manualHue, saturation: &manualSaturation, brightness: &manualBrightness, alpha: nil)
+
+        // 色相:系统强调色够鲜艳就跟随它,否则回退手动色(赤陶橙)色相,稳定不随机
+        let hue = accentSaturation > 0.12 ? accentHue : manualHue
+        // 饱和度:取够高的值并抬一档,保证鲜艳醒目
+        let saturation = max(0.72, min(0.95, max(accentSaturation, manualSaturation) + 0.12))
+        // 明度:始终偏亮醒目,只随系统深浅轻微微调,不再在浅色模式下发暗
+        let brightness: CGFloat = environment.isDarkAppearance ? 0.92 : 0.82
+        return NSColor(hue: hue,
+                       saturation: saturation,
+                       brightness: brightness,
+                       alpha: 1).usingColorSpace(.sRGB) ?? manual
+    }
+
+    private static func colorDistance(_ lhs: NSColor, _ rhs: NSColor) -> CGFloat {
+        let a = lhs.usingColorSpace(.sRGB) ?? lhs
+        let b = rhs.usingColorSpace(.sRGB) ?? rhs
+        let dr = a.redComponent - b.redComponent
+        let dg = a.greenComponent - b.greenComponent
+        let db = a.blueComponent - b.blueComponent
+        return sqrt(dr * dr + dg * dg + db * db)
+    }
+
+    private static func defaultManualColor() -> NSColor {
+        Settings.defaultPetColor
+    }
+
+    // MARK: 微信新消息提示
+    // 只通过辅助功能读取微信或 Dock 的未读提示文本,不读取微信数据库、不解密、不保存聊天内容。
+    private func updateWeChatNotificationMonitor() {
+        // 任一 IM(微信/飞书)开启就启动轮询,全部关闭才停。
+        if Self.imTargets.contains(where: { Settings.imNotificationsEnabled($0.settingsKey) }) {
+            startWeChatNotificationMonitor()
+        } else {
+            stopWeChatNotificationMonitor()
+        }
+    }
+
+    private func startWeChatNotificationMonitor() {
+        guard weChatNotificationTimer == nil else {
+            checkWeChatUnreadAndHint()
+            return
+        }
+        _ = Self.accessibilityTrusted(prompt: true)
+        checkWeChatUnreadAndHint()
+        let timer = Timer(timeInterval: Style.weChatNotificationCheckPeriod, repeats: true) { [weak self] _ in
+            self?.checkWeChatUnreadAndHint()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        weChatNotificationTimer = timer
+    }
+
+    private func stopWeChatNotificationMonitor() {
+        weChatNotificationTimer?.invalidate()
+        weChatNotificationTimer = nil
+        noticeHintTimer?.invalidate()
+        noticeHintTimer = nil
+        bannerHideTimer?.invalidate()
+        bannerHideTimer = nil
+        imLastUnread.removeAll()
+        if chewTimer == nil, !isHovering {
+            setFeedGlow(false)
+        }
+    }
+
+    private func checkWeChatUnreadAndHint() {
+        let enabled = Self.imTargets.filter { Settings.imNotificationsEnabled($0.settingsKey) }
+        guard !enabled.isEmpty else { return }
+        guard Self.accessibilityTrusted(prompt: false) else {
+            if Date().timeIntervalSince(lastWeChatPermissionHintAt) > 10 {
+                lastWeChatPermissionHintAt = Date()
+                showWeChatNotificationHint(message: "请开启辅助功能", duration: 8.0)
+            }
+            logWeChatAccessibilityFailure("接收 IM 通知需要在系统设置里允许 ClaudePet 使用辅助功能")
+            return
+        }
+        weChatAccessibilityFailureLogged = false
+        // 逐个 IM 读 Dock 角标:只在"无未读→有未读"或"未读数变多(来了新消息)"时提示;
+        // 读消息导致角标变少或清零绝不提示,避免已读后仍被打扰。
+        for target in enabled {
+            guard let count = Self.dockBadgeCount(titleKeywords: target.dockTitleKeywords) else {
+                imLastUnread[target.key] = nil   // 角标消失=已读清零,复位以便下次"无→有"边沿
+                continue
+            }
+            let becameUnread = imLastUnread[target.key] == nil
+            let countIncreased = count > (imLastUnread[target.key] ?? 0)
+            imLastUnread[target.key] = count
+            if becameUnread || countIncreased {
+                Self.log("\(target.displayName)新消息提示 count=\(count)")
+                flashNotice("\(target.displayName)来消息了 \(count) 条", accent: target.accent, duration: 6.0)
+            }
+        }
+    }
+
+    /// 微信未读提示用的强调色(绿色边框),与任务完成的橙色区分。
+    private static let weChatAccent = NSColor(srgbRed: 0.19, green: 0.80, blue: 0.40, alpha: 0.95)
+    /// 飞书未读提示用的强调色(蓝色边框),与微信绿、任务橙区分。
+    private static let larkAccent = NSColor(srgbRed: 0.20, green: 0.44, blue: 1.0, alpha: 0.95)
+
+    /// 受监控的即时通讯应用。微信、飞书各自独立开关与未读状态,共用同一套 Dock 角标探测与提示逻辑。
+    /// 未读数都挂在 Dock 图标的 AXStatusLabel 角标上,清零即消失,是最干净、随已读实时变化的信号。
+    private struct IMTarget {
+        let key: String                  // 区分各 IM 的未读状态与设置项
+        let displayName: String          // 横幅文案用:"微信" / "飞书"
+        let dockTitleKeywords: [String]  // 匹配 Dock 图标 title(小写包含即命中)
+        let settingsKey: String          // UserDefaults 开关键
+        let accent: NSColor              // 横幅强调色
+    }
+
+    private static let imTargets: [IMTarget] = [
+        IMTarget(key: "wechat", displayName: "微信", dockTitleKeywords: ["微信", "wechat"],
+                 settingsKey: "receiveWeChatNotifications", accent: weChatAccent),
+        IMTarget(key: "lark", displayName: "飞书", dockTitleKeywords: ["飞书", "lark"],
+                 settingsKey: "receiveLarkNotifications", accent: larkAccent),
+    ]
+
+    /// 微信未读提示:绿色横幅 + 通用庆祝动作。
+    private func showWeChatNotificationHint(message: String, duration: TimeInterval = 6.0) {
+        flashNotice(message, accent: Self.weChatAccent, duration: duration)
+    }
+
+    /// Claude Code / Codex 任务完成报喜:橙色(主色)横幅 + 同一套庆祝动作。
+    func showTaskDoneHint(message: String, duration: TimeInterval = 6.0) {
+        flashNotice(message, accent: Style.orange, duration: duration)
+    }
+
+    /// 通用通知观感:顶部弹横幅(accent 决定边框色)+ 发光 + 跳 + 摇 + 眯眼笑,定时复位。
+    /// 微信未读与任务完成共用,只是文案与强调色不同——避免两套重复的提示逻辑。
+    private func flashNotice(_ message: String, accent: NSColor, duration: TimeInterval = 6.0) {
+        showBanner(message, accent: accent, duration: duration)
+        setFeedGlow(true)
+        jump()
+        sway()
+        let canOwnEyes = !isHovering && !idleEyeActive && eyeMode == .normal
+        if canOwnEyes {
+            eyeMode = .happy
+            render()
+        }
+        noticeHintTimer?.invalidate()
+        let timer = Timer(timeInterval: 2.2, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            if canOwnEyes {
+                self.eyeMode = .normal
+                self.render()
+            }
+            if self.chewTimer == nil, !self.isHovering {
+                self.setFeedGlow(false)
+            }
+            self.noticeHintTimer = nil
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        noticeHintTimer = timer
+    }
+
+    private func showBanner(_ message: String, accent: NSColor, duration: TimeInterval) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        // 高度自适应:按文案在固定宽度下换行所需高度撑高横幅,底边贴星芒上方向上长
+        let hPad: CGFloat = 12, vPad: CGFloat = 7
+        let innerW = Style.bannerWidth - hPad * 2
+        let font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        let maxInnerH = Style.bannerMaxHeight - vPad * 2
+        let textRect = (message as NSString).boundingRect(
+            with: CGSize(width: innerW, height: maxInnerH),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: font])
+        let innerH = min(ceil(textRect.height), maxInnerH)
+        let bannerH = max(Style.bannerMinHeight, innerH + vPad * 2)
+        bannerLayer.frame = CGRect(x: (bounds.width - Style.bannerWidth) / 2,
+                                   y: Style.windowSize + Style.bannerGap,
+                                   width: Style.bannerWidth, height: bannerH)
+        bannerTextLayer.frame = CGRect(x: hPad, y: vPad, width: innerW, height: bannerH - vPad * 2)
+        bannerTextLayer.string = message
+        bannerLayer.borderColor = accent.cgColor   // 边框色随通知类型(微信绿 / 任务橙)
+        bannerLayer.opacity = 1
+        bannerLayer.transform = CATransform3DIdentity
+        CATransaction.commit()
+
+        let rise = CABasicAnimation(keyPath: "transform.translation.y")
+        rise.fromValue = -6
+        rise.toValue = 0
+        rise.duration = 0.18
+        rise.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        bannerLayer.add(rise, forKey: "banner-rise")
+
+        let pulse = CAKeyframeAnimation(keyPath: "opacity")
+        pulse.values = [1, 1, 0]
+        pulse.keyTimes = [0, 0.76, 1]
+        pulse.duration = duration
+        pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        bannerLayer.add(pulse, forKey: "banner-opacity")
+
+        bannerHideTimer?.invalidate()
+        let hide = Timer(timeInterval: duration, repeats: false) { [weak self] _ in
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            self?.bannerLayer.opacity = 0
+            self?.bannerLayer.transform = CATransform3DIdentity
+            CATransaction.commit()
+            self?.bannerHideTimer = nil
+        }
+        RunLoop.main.add(hide, forMode: .common)
+        bannerHideTimer = hide
+    }
+
+    private func logWeChatAccessibilityFailure(_ message: String) {
+        guard !weChatAccessibilityFailureLogged else { return }
+        weChatAccessibilityFailureLogged = true
+        Self.log(message)
+    }
+
+    private struct WeChatUnreadSnapshot {
+        let hasUnread: Bool
+        let count: Int?
+        let source: String
+    }
+
+    private struct WeChatUnreadInfo {
+        let count: Int?
+    }
+
+    fileprivate static func accessibilityTrusted(prompt: Bool) -> Bool {
+        if prompt {
+            let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
+            return AXIsProcessTrustedWithOptions([key: true] as CFDictionary)
+        }
+        return AXIsProcessTrusted()
+    }
+
+    private static func detectWeChatUnread() -> WeChatUnreadSnapshot? {
+        guard let count = dockBadgeCount(titleKeywords: ["微信", "wechat"]) else { return nil }
+        return WeChatUnreadSnapshot(hasUnread: true, count: count, source: "Dock角标")
+    }
+
+    /// 自取 Dock 进程根,在其 AXDockItem 列表里找 title 命中关键词的图标,读 AXStatusLabel 角标数。
+    private static func dockBadgeCount(titleKeywords: [String]) -> Int? {
+        guard let dock = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == "com.apple.dock" }) else { return nil }
+        return dockBadgeCount(in: AXUIElementCreateApplication(dock.processIdentifier), titleKeywords: titleKeywords)
+    }
+
+    /// 角标随已读/未读实时增减、清零即消失,是判定"有没有新消息"最干净的依据;用 title 关键词
+    /// 限定,避免错认 App Store/系统设置等其它带角标的图标。
+    private static func dockBadgeCount(in root: AXUIElement, titleKeywords: [String]) -> Int? {
+        var stack: [(AXUIElement, Int)] = [(root, 0)]
+        var visited = 0
+        while let (element, depth) = stack.popLast(), visited < 400 {
+            visited += 1
+            if accessibilityText(kAXRoleAttribute as CFString, from: element) == "AXDockItem" {
+                let title = (accessibilityText(kAXTitleAttribute as CFString, from: element) ?? "").lowercased()
+                if titleKeywords.contains(where: { title.contains($0.lowercased()) }),
+                   let label = accessibilityText("AXStatusLabel" as CFString, from: element),
+                   let count = leadingPositiveInteger(in: label) {
+                    return count
+                }
+            }
+            guard depth < 4 else { continue }
+            for attribute in [kAXChildrenAttribute as CFString, kAXVisibleChildrenAttribute as CFString] {
+                guard let value = copyAccessibilityAttribute(attribute, from: element),
+                      let children = value as? [AXUIElement] else { continue }
+                for child in children.reversed() {
+                    stack.append((child, depth + 1))
+                }
+            }
+        }
+        return nil
+    }
+
+    /// 解析角标文本开头的正整数:"2"→2、"99+"→99;无数字或为 0 则 nil。
+    private static func leadingPositiveInteger(in text: String) -> Int? {
+        var digits = ""
+        for ch in text {
+            if ch.isNumber { digits.append(ch) } else { break }
+        }
+        guard let value = Int(digits), value > 0 else { return nil }
+        return value
+    }
+
+    fileprivate static func weChatDetectionStatus() -> String {
+        guard Settings.receiveWeChatNotifications else {
+            return "微信通知开关:关闭"
+        }
+        guard accessibilityTrusted(prompt: false) else {
+            return "微信通知开关:开启\n辅助功能权限:未授权"
+        }
+        if let snapshot = detectWeChatUnread() {
+            return "微信通知开关:开启\n辅助功能权限:已授权\n检测结果:有未读\n来源:\(snapshot.source)\n数量:\(snapshot.count.map(String.init) ?? "未知")"
+        }
+        return "微信通知开关:开启\n辅助功能权限:已授权\n检测结果:未发现未读提示"
+    }
+
+    private static func detectWeChatUnreadFromWindowList() -> WeChatUnreadSnapshot? {
+        guard let info = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]] else {
+            return nil
+        }
+        var bestCount: Int?
+        var hasUnread = false
+        for item in info {
+            let owner = item[kCGWindowOwnerName as String] as? String ?? ""
+            let title = item[kCGWindowName as String] as? String ?? ""
+            let joined = "\(owner) \(title)"
+            let lower = joined.lowercased()
+            let mentionsWeChat = lower.contains("wechat") || joined.contains("微信")
+            guard mentionsWeChat else { continue }
+            if let unread = unreadInfo(from: joined, requiresWeChatName: true) {
+                hasUnread = true
+                if let count = unread.count {
+                    bestCount = max(bestCount ?? 0, count)
+                }
+            }
+        }
+        return hasUnread ? WeChatUnreadSnapshot(hasUnread: true, count: bestCount, source: "窗口标题") : nil
+    }
+
+    private static func unreadSnapshot(in root: AXUIElement, requiresWeChatName: Bool, source: String) -> WeChatUnreadSnapshot? {
+        var stack: [(AXUIElement, Int)] = [(root, 0)]
+        var visited = 0
+        var bestCount: Int?
+        var hasUnread = false
+        let textAttributes: [CFString] = [
+            kAXTitleAttribute as CFString,
+            kAXDescriptionAttribute as CFString,
+            kAXValueAttribute as CFString,
+            kAXHelpAttribute as CFString,
+        ]
+        let childAttributes: [CFString] = [
+            kAXChildrenAttribute as CFString,
+            kAXVisibleChildrenAttribute as CFString,
+            kAXWindowsAttribute as CFString,
+        ]
+
+        while let (element, depth) = stack.popLast(), visited < 700 {
+            visited += 1
+            var texts: [String] = []
+            for attribute in textAttributes {
+                if let text = accessibilityText(attribute, from: element) {
+                    texts.append(text)
+                }
+            }
+            let joined = texts.joined(separator: " ")
+            if !joined.isEmpty, let unread = unreadInfo(from: joined, requiresWeChatName: requiresWeChatName) {
+                hasUnread = true
+                if let count = unread.count {
+                    bestCount = max(bestCount ?? 0, count)
+                }
+            }
+
+            guard depth < 6 else { continue }
+            for attribute in childAttributes {
+                guard let value = copyAccessibilityAttribute(attribute, from: element) else { continue }
+                if CFGetTypeID(value) == AXUIElementGetTypeID() {
+                    stack.append((value as! AXUIElement, depth + 1))
+                } else if let children = value as? [AXUIElement] {
+                    for child in children.reversed() {
+                        stack.append((child, depth + 1))
+                    }
+                }
+            }
+        }
+        return hasUnread ? WeChatUnreadSnapshot(hasUnread: true, count: bestCount, source: source) : nil
+    }
+
+    private static func copyAccessibilityAttribute(_ attribute: CFString, from element: AXUIElement) -> CFTypeRef? {
+        var value: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(element, attribute, &value)
+        guard result == .success else { return nil }
+        return value
+    }
+
+    private static func accessibilityText(_ attribute: CFString, from element: AXUIElement) -> String? {
+        guard let value = copyAccessibilityAttribute(attribute, from: element) else { return nil }
+        if let text = value as? String {
+            return text
+        }
+        if let attributed = value as? NSAttributedString {
+            return attributed.string
+        }
+        if let number = value as? NSNumber {
+            return number.stringValue
+        }
+        return nil
+    }
+
+    // MARK: 微信探测诊断(临时取证)
+    // 把 Dock 与微信辅助功能树里所有"有信息量"的字段(含专放角标的 AXStatusLabel)dump 到 /tmp/claudepet.log,
+    // 据真实字样对症修探测规则。临时手段:定准规则后连同 --wechat-dump 与菜单项一并移除。
+    fileprivate static func dumpWeChatAccessibilityTree() {
+        log("==== 微信探测诊断开始 ====")
+        guard accessibilityTrusted(prompt: true) else {
+            log("诊断中止:辅助功能未授权")
+            return
+        }
+        let apps = NSWorkspace.shared.runningApplications
+        if let dock = apps.first(where: { $0.bundleIdentifier == "com.apple.dock" }) {
+            log("---- 来源 Dock(pid=\(dock.processIdentifier)) ----")
+            dumpTree(AXUIElementCreateApplication(dock.processIdentifier), source: "Dock")
+        } else {
+            log("未发现 Dock 进程")
+        }
+        let weChatApps = apps.filter { app in
+            let bundle = app.bundleIdentifier?.lowercased() ?? ""
+            let name = app.localizedName?.lowercased() ?? ""
+            return bundle.contains("wechat") || bundle.contains("xinwechat") || name.contains("wechat") || name.contains("微信")
+        }
+        if weChatApps.isEmpty { log("未发现微信进程") }
+        for app in weChatApps {
+            log("---- 来源 \(app.localizedName ?? "微信")(bundle=\(app.bundleIdentifier ?? "?")) ----")
+            dumpTree(AXUIElementCreateApplication(app.processIdentifier), source: app.localizedName ?? "微信")
+        }
+        log("==== 微信探测诊断结束 ====")
+    }
+
+    private static func dumpTree(_ root: AXUIElement, source: String) {
+        let dumpAttributes: [(String, CFString)] = [
+            ("role", kAXRoleAttribute as CFString),
+            ("roleDesc", kAXRoleDescriptionAttribute as CFString),
+            ("title", kAXTitleAttribute as CFString),
+            ("desc", kAXDescriptionAttribute as CFString),
+            ("value", kAXValueAttribute as CFString),
+            ("help", kAXHelpAttribute as CFString),
+            ("statusLabel", "AXStatusLabel" as CFString),
+            ("id", kAXIdentifierAttribute as CFString),
+        ]
+        let childAttributes: [CFString] = [
+            kAXChildrenAttribute as CFString,
+            kAXVisibleChildrenAttribute as CFString,
+            kAXWindowsAttribute as CFString,
+        ]
+        let keywords = ["未读", "消息", "通知", "新", "项目", "条", "badge", "unread", "message", "new", "item", "dot"]
+        var stack: [(AXUIElement, Int)] = [(root, 0)]
+        var visited = 0
+        var logged = 0
+        while let (element, depth) = stack.popLast(), visited < 4000, logged < 250 {
+            visited += 1
+            var fields: [String] = []
+            var joined = ""
+            for (name, attribute) in dumpAttributes {
+                if let text = accessibilityText(attribute, from: element), !text.isEmpty {
+                    fields.append("\(name)=「\(text)」")
+                    joined += " " + text
+                }
+            }
+            if !fields.isEmpty {
+                let lower = joined.lowercased()
+                let mentionsWeChat = lower.contains("wechat") || joined.contains("微信")
+                let hasDigit = joined.unicodeScalars.contains { CharacterSet.decimalDigits.contains($0) }
+                let hasKeyword = keywords.contains { joined.contains($0) || lower.contains($0.lowercased()) }
+                if hasDigit || mentionsWeChat || hasKeyword {
+                    logged += 1
+                    log("[\(source) d\(depth)] " + fields.joined(separator: " "))
+                }
+            }
+            guard depth < 8 else { continue }
+            for attribute in childAttributes {
+                guard let value = copyAccessibilityAttribute(attribute, from: element) else { continue }
+                if CFGetTypeID(value) == AXUIElementGetTypeID() {
+                    stack.append((value as! AXUIElement, depth + 1))
+                } else if let children = value as? [AXUIElement] {
+                    for child in children.reversed() {
+                        stack.append((child, depth + 1))
+                    }
+                }
+            }
+        }
+        log("[\(source)] 遍历节点=\(visited) 记录=\(logged)")
+    }
+
+    /// 真·未读量词:必须紧跟在数字后面才算未读信号。Dock 角标念作"N 个新项目 / N new items",
+    /// 明确未读标签念作"N 条未读 / N unread"。刻意不收"消息""通知"这类微信界面常驻词——
+    /// 那些词只要微信开着就恒在,会把"有界面"误判成"有未读",正是已读后仍刷屏的祸根。
+    private static let unreadUnitPhrases = ["个新项目", "新项目", "条未读", "个未读", "未读",
+                                            "new items", "new item", "unread"]
+
+    private static func unreadInfo(from text: String, requiresWeChatName: Bool) -> WeChatUnreadInfo? {
+        let lower = text.lowercased()
+        let mentionsWeChat = lower.contains("wechat") || text.contains("微信")
+        guard !requiresWeChatName || mentionsWeChat else { return nil }
+        // 只认"数字 + 未读量词"紧邻出现的结构化未读,数字必须贴着量词;
+        // 不再把文本里任意第一个整数(时间/群人数/版本号)当条数。
+        return unreadCountFromBadgePhrase(in: text)
+    }
+
+    /// 扫描"数字紧跟未读量词"的角标短语(如"3 个新项目""5 unread"),取其中最大数字为未读条数。
+    private static func unreadCountFromBadgePhrase(in text: String) -> WeChatUnreadInfo? {
+        let scalars = Array(text.unicodeScalars)
+        var index = 0
+        var best: Int?
+        while index < scalars.count {
+            guard CharacterSet.decimalDigits.contains(scalars[index]) else {
+                index += 1
+                continue
+            }
+            var digits = ""
+            while index < scalars.count, CharacterSet.decimalDigits.contains(scalars[index]) {
+                digits.append(String(scalars[index]))
+                index += 1
+            }
+            // 跳过数字与量词间的空白(普通空格/不换行空格等),量词须紧随其后
+            var tail = index
+            while tail < scalars.count, CharacterSet.whitespaces.contains(scalars[tail]) {
+                tail += 1
+            }
+            let rest = String(String.UnicodeScalarView(scalars[tail...])).lowercased()
+            if let value = Int(digits), value > 0,
+               unreadUnitPhrases.contains(where: { rest.hasPrefix($0) }) {
+                best = max(best ?? 0, value)
+            }
+        }
+        guard let best else { return nil }
+        return WeChatUnreadInfo(count: best)
     }
 
     // MARK: 进食动画:拖入文件时张嘴咀嚼,离开/吃下即闭嘴
@@ -197,9 +985,10 @@ final class PetView: NSView {
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         trackingAreas.forEach(removeTrackingArea) // 尺寸变化时重建,避免叠加多个
+        // 只在星芒身体上响应 hover——窗口为容纳自适应横幅留了大片顶部透明区,不该一碰就笑
         addTrackingArea(NSTrackingArea(
-            rect: bounds,
-            options: [.activeAlways, .mouseEnteredAndExited, .inVisibleRect],
+            rect: petFrameInBounds,
+            options: [.activeAlways, .mouseEnteredAndExited],
             owner: self
         ))
     }
@@ -240,6 +1029,27 @@ final class PetView: NSView {
         j.timingFunctions = [CAMediaTimingFunction(name: .easeOut), CAMediaTimingFunction(name: .easeIn)]
         j.duration = 0.45
         iconLayer.add(j, forKey: "jump")
+    }
+
+    /// 扑食滑行期间切换跑步腿相位;腿本身仍由 starImage 画进同一帧,不新增图层。
+    private func startRunningLegs() {
+        guard runTimer == nil else { return }
+        runPhase = 1
+        render()
+        let timer = Timer(timeInterval: 0.16, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.runPhase = self.runPhase == 1 ? 2 : 1
+            self.render()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        runTimer = timer
+    }
+
+    private func stopRunningLegs() {
+        runTimer?.invalidate()
+        runTimer = nil
+        runPhase = 0
+        render()
     }
 
     /// 左右摇晃:transform.rotation.z 来回摆几下(弧度),与呼吸 scale 互不干扰。
@@ -338,14 +1148,15 @@ final class PetView: NSView {
         let home = window.frame.origin                     // 记住静止原位,吃完滑回
         let size = window.frame.size
         let mouse = NSEvent.mouseLocation
-        let target = NSPoint(x: mouse.x - size.width / 2,  // 窗口中心对准光标
-                             y: mouse.y - size.height / 2)
+        let target = NSPoint(x: mouse.x - size.width / 2,  // 桌宠身体中心对准光标,顶部横幅不参与定位
+                             y: mouse.y - Style.windowSize / 2)
         Self.log("扑食 mouse=\(NSStringFromPoint(mouse)) home=\(NSStringFromPoint(home)) target=\(NSStringFromPoint(target))")
 
-        slideWindow(window, from: home, to: target, duration: 0.35) { [weak self] in
+        let duration = Settings.pounceDuration
+        slideWindow(window, from: home, to: target, duration: duration) { [weak self] in
             self?.eatBite()                                // 到位:张嘴嚼一口
             let back = Timer(timeInterval: 0.9, repeats: false) { [weak self] _ in
-                self?.slideWindow(window, from: target, to: home, duration: 0.35) {
+                self?.slideWindow(window, from: target, to: home, duration: Settings.pounceDuration) {
                     self?.isPouncing = false               // 滑回到家,解除扑食锁
                     onDone()                               // 整段扑食结束才开终端,否则 Ghostty 弹出会盖住滑行
                 }
@@ -359,15 +1170,23 @@ final class PetView: NSView {
     /// 逐帧 setFrameOrigin 必定可见可控,与项目"咀嚼用 Timer 手动切帧"一脉相承。
     private func slideWindow(_ window: NSWindow, from: NSPoint, to: NSPoint,
                              duration: Double, then: @escaping () -> Void) {
+        startRunningLegs()
         let steps = max(1, Int(duration * 60))             // 约 60fps
+        let strideCount = max(2, Int(duration / 0.18))     // 每段滑行分成几步,用于上下起伏出"走过去"的节奏
+        let bobHeight = Style.windowSize * 0.055
         var i = 0
         let timer = Timer(timeInterval: duration / Double(steps), repeats: true) { t in
             i += 1
             let p = Double(i) / Double(steps)
             let e = p * p * (3 - 2 * p)                     // smoothstep:缓入缓出
+            let bob = sin(p * Double(strideCount) * .pi) * Double(bobHeight)
             window.setFrameOrigin(NSPoint(x: from.x + (to.x - from.x) * CGFloat(e),
-                                          y: from.y + (to.y - from.y) * CGFloat(e)))
-            if i >= steps { t.invalidate(); then() }
+                                          y: from.y + (to.y - from.y) * CGFloat(e) + CGFloat(bob)))
+            if i >= steps {
+                t.invalidate()
+                self.stopRunningLegs()
+                then()
+            }
         }
         RunLoop.main.add(timer, forMode: .common)
     }
@@ -394,11 +1213,12 @@ final class PetView: NSView {
     }
 
     /// 标记为离屏快照模式(铺深色底),供 renderSnapshot 直接调用 draw 使用
-    func prepareSnapshot(withBackground: Bool, mouthOpen: CGFloat = 0, eyeLook: CGVector = CGVector(dx: 0, dy: 0), eyeMode: EyeMode = .normal) {
+    func prepareSnapshot(withBackground: Bool, mouthOpen: CGFloat = 0, eyeLook: CGVector = CGVector(dx: 0, dy: 0), eyeMode: EyeMode = .normal, runPhase: Int = 0) {
         snapshotBackground = withBackground
         snapshotMouthOpen = mouthOpen
         snapshotEyeLook = eyeLook
         snapshotEyeMode = eyeMode
+        snapshotRunPhase = runPhase
     }
 
     // MARK: 绘制(仅离屏快照走此路径;运行时由图层显示)
@@ -408,13 +1228,13 @@ final class PetView: NSView {
             ctx.setFillColor(NSColor(srgbRed: 0x1E / 255.0, green: 0x1E / 255.0, blue: 0x1E / 255.0, alpha: 1).cgColor)
             ctx.fill(bounds)
         }
-        Self.starImage(size: bounds.size, mouthOpen: snapshotMouthOpen, eyeLook: snapshotEyeLook, eyeMode: snapshotEyeMode).draw(in: bounds) // NSImage 自动处理坐标翻转
+        Self.starImage(size: bounds.size, mouthOpen: snapshotMouthOpen, eyeLook: snapshotEyeLook, eyeMode: snapshotEyeMode, runPhase: snapshotRunPhase).draw(in: bounds) // NSImage 自动处理坐标翻转
     }
 
     // MARK: 星星图标渲染
     /// 把 starArt 的方块字符逐个按 2×2 象限自绘成星芒:不走字体、直接填充矩形,
     /// 故无字体拼接缝隙,能严丝合缝还原终端里的样子;cell 取瘦高比例,呼应终端字符格。
-    private static func starImage(size: CGSize, mouthOpen: CGFloat = 0, eyeLook: CGVector = CGVector(dx: 0, dy: 0), eyeMode: EyeMode = .normal) -> NSImage {
+    private static func starImage(size: CGSize, mouthOpen: CGFloat = 0, eyeLook: CGVector = CGVector(dx: 0, dy: 0), eyeMode: EyeMode = .normal, runPhase: Int = 0) -> NSImage {
         let image = NSImage(size: size)
         image.lockFocus()
         defer { image.unlockFocus() }
@@ -423,29 +1243,43 @@ final class PetView: NSView {
         let rowCount = starArt.count
         let colCount = starArt.map(\.count).max() ?? 1
         let aspect: CGFloat = 2.0                       // cell 高/宽,模拟终端瘦高字符格
-        let fill: CGFloat = 0.52                        // 网格占窗口比例:小巧居中又能看清表情
+        let fill: CGFloat = 0.66                        // 网格占窗口比例:占大些更醒目,仍给外发光与边距留余量
         let cellW = min(size.width * fill / CGFloat(colCount),
                         size.height * fill / (CGFloat(rowCount) * aspect))
         let cellH = cellW * aspect
         let originX = (size.width - cellW * CGFloat(colCount)) / 2
         let originY = (size.height - cellH * CGFloat(rowCount)) / 2
 
-        ctx.setFillColor(Style.orange.cgColor)
-        for (r, line) in starArt.enumerated() {
-            for (c, ch) in line.enumerated() {
-                let q = quadrants(of: ch)
-                let x = originX + CGFloat(c) * cellW
-                let y = originY + CGFloat(rowCount - 1 - r) * cellH // y 轴向上,故行号倒置
-                let hw = cellW / 2, hh = cellH / 2
-                if q.0 { ctx.fill(CGRect(x: x,      y: y + hh, width: hw, height: hh)) } // 左上
-                if q.1 { ctx.fill(CGRect(x: x + hw, y: y + hh, width: hw, height: hh)) } // 右上
-                if q.2 { ctx.fill(CGRect(x: x,      y: y,      width: hw, height: hh)) } // 左下
-                if q.3 { ctx.fill(CGRect(x: x + hw, y: y,      width: hw, height: hh)) } // 右下
+        // 逐象限把 starArt 填成星芒主体
+        func fillStar() {
+            for (r, line) in starArt.enumerated() {
+                for (c, ch) in line.enumerated() {
+                    let q = quadrants(of: ch)
+                    let x = originX + CGFloat(c) * cellW
+                    let y = originY + CGFloat(rowCount - 1 - r) * cellH // y 轴向上,故行号倒置
+                    let hw = cellW / 2, hh = cellH / 2
+                    if q.0 { ctx.fill(CGRect(x: x,      y: y + hh, width: hw, height: hh)) } // 左上
+                    if q.1 { ctx.fill(CGRect(x: x + hw, y: y + hh, width: hw, height: hh)) } // 右上
+                    if q.2 { ctx.fill(CGRect(x: x,      y: y,      width: hw, height: hh)) } // 左下
+                    if q.3 { ctx.fill(CGRect(x: x + hw, y: y,      width: hw, height: hh)) } // 右下
+                }
             }
         }
 
+        // 给星芒整体投一圈柔和的对比外发光,把形状从背景里托出来:
+        // 用 transparency layer 把所有象限当成单一整体投影,内部拼缝不各自留影、只勾外轮廓,
+        // 比硬描边更自然、不糊尖角(暗主色配白晕、亮主色配深晕);不依赖背景采样或权限。
+        ctx.saveGState()
+        ctx.setShadow(offset: .zero, blur: max(2.5, cellW * 0.55), color: outlineColor(for: Style.orange).cgColor)
+        ctx.beginTransparencyLayer(auxiliaryInfo: nil)
+        ctx.setFillColor(Style.orange.cgColor)
+        fillStar()
+        ctx.endTransparencyLayer()
+        ctx.restoreGState()
+
         moveBuiltInEyeHoles(ctx, size: size, originX: originX, originY: originY,
                             cellW: cellW, cellH: cellH, look: eyeLook, mode: eyeMode)
+        drawRunningLegsIfNeeded(ctx, size: size, originY: originY, cellW: cellW, cellH: cellH, phase: runPhase)
 
         // 进食态:在脸部中下方画一张暗色横口,开合幅度由 mouthOpen 决定(0 则无嘴)
         if mouthOpen > 0 {
@@ -461,6 +1295,39 @@ final class PetView: NSView {
             ctx.fill(mouthRect)
         }
         return image
+    }
+
+    /// 跑步态只改原本底部两条腿:先用背景橙补掉静止腿,再画成交替前后摆动的短腿。
+    private static func drawRunningLegsIfNeeded(_ ctx: CGContext, size: CGSize,
+                                                originY: CGFloat, cellW: CGFloat,
+                                                cellH: CGFloat, phase: Int) {
+        guard phase > 0 else { return }
+        let legWidth = cellW * 0.5
+        let longLegHeight = cellH * 0.56
+        let shortLegHeight = cellH * 0.32
+        let legY = originY - cellH * 0.03
+        let baseCenters = [
+            size.width / 2 - cellW * 1.05,
+            size.width / 2 + cellW * 1.05,
+        ]
+
+        for x in baseCenters {
+            ctx.clear(CGRect(x: x - legWidth * 1.1, y: legY - cellH * 0.08,
+                             width: legWidth * 2.2, height: longLegHeight + cellH * 0.18))
+        }
+
+        ctx.setFillColor(Style.orange.cgColor)
+        let offsets: [CGFloat] = phase % 2 == 1 ? [-cellW * 0.22, cellW * 0.16] : [cellW * 0.16, -cellW * 0.22]
+        let heights: [CGFloat] = phase % 2 == 1 ? [longLegHeight, shortLegHeight] : [shortLegHeight, longLegHeight]
+        for ((x, offset), height) in zip(zip(baseCenters, offsets), heights) {
+            let foot = CGRect(
+                x: x + offset - legWidth / 2,
+                y: legY,
+                width: legWidth,
+                height: height
+            )
+            ctx.fill(foot)
+        }
     }
 
     /// 复用原图里的两个深色竖向空位作为眼睛:先补回原空位(铺橙),再按眼形清出对应深色形状。
@@ -535,6 +1402,17 @@ final class PetView: NSView {
         }
     }
 
+    /// 轮廓光晕色:与主色形成稳定反差(暗主色配近白、亮主色配近黑暖),
+    /// 作星芒外发光把形状从任何桌面背景里托出来,是"看不清"的核心兜底。
+    private static func outlineColor(for color: NSColor) -> NSColor {
+        let c = color.usingColorSpace(.sRGB) ?? color
+        var brightness: CGFloat = 0
+        c.getHue(nil, saturation: nil, brightness: &brightness, alpha: nil)
+        return brightness < 0.55
+            ? NSColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.95)          // 暗主色 → 近白描边
+            : NSColor(srgbRed: 0.10, green: 0.08, blue: 0.05, alpha: 0.95) // 亮主色 → 近黑暖描边
+    }
+
     /// 终端块元素字符 → 2×2 象限填充开关 (左上, 右上, 左下, 右下)
     private static func quadrants(of ch: Character) -> (Bool, Bool, Bool, Bool) {
         switch ch {
@@ -562,8 +1440,40 @@ final class PetView: NSView {
         title.isEnabled = false
         menu.addItem(title)
         menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "设置...", action: #selector(AppDelegate.showSettings(_:)), keyEquivalent: ","))
+        let testWeChat = NSMenuItem(title: "测试微信提示", action: #selector(testWeChatNotificationHint(_:)), keyEquivalent: "")
+        testWeChat.target = self
+        menu.addItem(testWeChat)
+        let testLark = NSMenuItem(title: "测试飞书提示", action: #selector(testLarkNotificationHint(_:)), keyEquivalent: "")
+        testLark.target = self
+        menu.addItem(testLark)
+        let testTaskDone = NSMenuItem(title: "测试任务完成提示", action: #selector(testTaskDoneHint(_:)), keyEquivalent: "")
+        testTaskDone.target = self
+        menu.addItem(testTaskDone)
+        let dumpItem = NSMenuItem(title: "导出微信探测详情", action: #selector(exportWeChatDiagnostics(_:)), keyEquivalent: "")
+        dumpItem.target = self
+        menu.addItem(dumpItem)
         menu.addItem(NSMenuItem(title: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         return menu
+    }
+
+    @objc private func testWeChatNotificationHint(_ sender: Any?) {
+        showWeChatNotificationHint(message: "微信来消息了")
+    }
+
+    @objc private func testLarkNotificationHint(_ sender: Any?) {
+        flashNotice("飞书来消息了", accent: Self.larkAccent)
+    }
+
+    @objc private func testTaskDoneHint(_ sender: Any?) {
+        // 演示带任务简介的自适应横幅:长任务会自动换行加高
+        showTaskDoneHint(message: "Claude · 把登录模块重构成 async/await 并补全单元测试和错误处理")
+    }
+
+    // 临时诊断:把 Dock 与微信辅助功能树的真实字段 dump 到 /tmp/claudepet.log,取证后移除
+    @objc private func exportWeChatDiagnostics(_ sender: Any?) {
+        Self.dumpWeChatAccessibilityTree()
+        showWeChatNotificationHint(message: "已导出探测详情")
     }
 
     // MARK: 拖放投喂:接住拖入的文件/目录,唤起 claude code 分析
@@ -828,18 +1738,184 @@ enum GlobalHotKey {
 
 // MARK: - 应用代理
 @MainActor
+final class SettingsWindowController: NSWindowController {
+    private let valueLabel = NSTextField(labelWithString: "")
+    private let colorTitle = NSTextField(labelWithString: "手动颜色")
+    private let colorWell = NSColorWell(frame: .zero)
+    private let autoAdaptButton = NSButton(checkboxWithTitle: "自动适应环境", target: nil, action: nil)
+    private let weChatNotificationsButton = NSButton(checkboxWithTitle: "接收微信", target: nil, action: nil)
+    private let larkNotificationsButton = NSButton(checkboxWithTitle: "接收飞书", target: nil, action: nil)
+    private let taskDoneNotificationsButton = NSButton(checkboxWithTitle: "任务完成提示", target: nil, action: nil)
+    private let slider = NSSlider(value: Settings.pounceDuration,
+                                  minValue: Settings.minPounceDuration,
+                                  maxValue: Settings.maxPounceDuration,
+                                  target: nil,
+                                  action: nil)
+
+    init() {
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 320))
+        let window = NSWindow(
+            contentRect: content.frame,
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "ClaudePet 设置"
+        window.isReleasedWhenClosed = false
+        window.contentView = content
+        super.init(window: window)
+        buildContent(in: content)
+        updateValueLabel()
+        colorWell.color = Settings.petColor
+        updateColorControls()
+        updateWeChatControls()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("不支持 Interface Builder 加载") }
+
+    private func buildContent(in content: NSView) {
+        let title = NSTextField(labelWithString: "移动速度")
+        title.font = .systemFont(ofSize: 15, weight: .semibold)
+        title.frame = NSRect(x: 24, y: 278, width: 120, height: 22)
+        content.addSubview(title)
+
+        valueLabel.alignment = .right
+        valueLabel.frame = NSRect(x: 180, y: 278, width: 116, height: 22)
+        content.addSubview(valueLabel)
+
+        slider.target = self
+        slider.action = #selector(sliderChanged(_:))
+        slider.numberOfTickMarks = 6
+        slider.allowsTickMarkValuesOnly = false
+        slider.frame = NSRect(x: 24, y: 240, width: 272, height: 24)
+        content.addSubview(slider)
+
+        let fast = NSTextField(labelWithString: "快")
+        fast.textColor = .secondaryLabelColor
+        fast.frame = NSRect(x: 24, y: 214, width: 40, height: 18)
+        content.addSubview(fast)
+
+        let slow = NSTextField(labelWithString: "慢")
+        slow.textColor = .secondaryLabelColor
+        slow.alignment = .right
+        slow.frame = NSRect(x: 256, y: 214, width: 40, height: 18)
+        content.addSubview(slow)
+
+        colorTitle.font = .systemFont(ofSize: 15, weight: .semibold)
+        colorTitle.frame = NSRect(x: 24, y: 176, width: 100, height: 22)
+        content.addSubview(colorTitle)
+
+        colorWell.target = self
+        colorWell.action = #selector(colorChanged(_:))
+        colorWell.frame = NSRect(x: 248, y: 170, width: 48, height: 32)
+        content.addSubview(colorWell)
+
+        autoAdaptButton.target = self
+        autoAdaptButton.action = #selector(autoAdaptChanged(_:))
+        autoAdaptButton.frame = NSRect(x: 24, y: 134, width: 160, height: 24)
+        content.addSubview(autoAdaptButton)
+
+        weChatNotificationsButton.target = self
+        weChatNotificationsButton.action = #selector(weChatNotificationsChanged(_:))
+        weChatNotificationsButton.frame = NSRect(x: 24, y: 96, width: 130, height: 24)
+        content.addSubview(weChatNotificationsButton)
+
+        larkNotificationsButton.target = self
+        larkNotificationsButton.action = #selector(larkNotificationsChanged(_:))
+        larkNotificationsButton.frame = NSRect(x: 168, y: 96, width: 130, height: 24)
+        content.addSubview(larkNotificationsButton)
+
+        taskDoneNotificationsButton.target = self
+        taskDoneNotificationsButton.action = #selector(taskDoneNotificationsChanged(_:))
+        taskDoneNotificationsButton.frame = NSRect(x: 24, y: 58, width: 200, height: 24)
+        content.addSubview(taskDoneNotificationsButton)
+
+        let close = NSButton(title: "关闭", target: self, action: #selector(closeWindow(_:)))
+        close.bezelStyle = .rounded
+        close.frame = NSRect(x: 218, y: 18, width: 78, height: 28)
+        content.addSubview(close)
+    }
+
+    @objc private func sliderChanged(_ sender: NSSlider) {
+        Settings.pounceDuration = sender.doubleValue
+        updateValueLabel()
+    }
+
+    @objc private func colorChanged(_ sender: NSColorWell) {
+        Settings.petColor = sender.color
+        NotificationCenter.default.post(name: .petColorDidChange, object: nil)
+    }
+
+    @objc private func autoAdaptChanged(_ sender: NSButton) {
+        Settings.autoAdaptColor = sender.state == .on
+        updateColorControls()
+        NotificationCenter.default.post(name: .autoAdaptColorDidChange, object: nil)
+    }
+
+    @objc private func weChatNotificationsChanged(_ sender: NSButton) {
+        Settings.setIMNotificationsEnabled("receiveWeChatNotifications", sender.state == .on)
+        updateWeChatControls()
+        if sender.state == .on {
+            _ = PetView.accessibilityTrusted(prompt: true)
+        }
+        NotificationCenter.default.post(name: .weChatNotificationsDidChange, object: nil)
+    }
+
+    @objc private func larkNotificationsChanged(_ sender: NSButton) {
+        Settings.setIMNotificationsEnabled("receiveLarkNotifications", sender.state == .on)
+        updateWeChatControls()
+        if sender.state == .on {
+            _ = PetView.accessibilityTrusted(prompt: true)
+        }
+        NotificationCenter.default.post(name: .weChatNotificationsDidChange, object: nil)
+    }
+
+    @objc private func taskDoneNotificationsChanged(_ sender: NSButton) {
+        Settings.receiveTaskDoneNotifications = sender.state == .on
+        updateWeChatControls()
+    }
+
+    @objc private func closeWindow(_ sender: Any?) {
+        close()
+    }
+
+    private func updateValueLabel() {
+        valueLabel.stringValue = String(format: "%.2f 秒", Settings.pounceDuration)
+    }
+
+    private func updateColorControls() {
+        let autoAdaptColor = Settings.autoAdaptColor
+        autoAdaptButton.state = autoAdaptColor ? .on : .off
+        colorWell.isEnabled = !autoAdaptColor
+        colorTitle.textColor = autoAdaptColor ? .secondaryLabelColor : .labelColor
+    }
+
+    private func updateWeChatControls() {
+        weChatNotificationsButton.state = Settings.imNotificationsEnabled("receiveWeChatNotifications") ? .on : .off
+        larkNotificationsButton.state = Settings.imNotificationsEnabled("receiveLarkNotifications") ? .on : .off
+        taskDoneNotificationsButton.state = Settings.receiveTaskDoneNotifications ? .on : .off
+    }
+}
+
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow!
+    private weak var petView: PetView?
+    private var settingsWindowController: SettingsWindowController?
+    /// 任务完成提示节流:记下每个(工具+目录)上次弹的时间,窗口内重复来的直接跳过,免得连答几轮时连珠炮
+    private var lastTaskDoneAt: [String: Date] = [:]
+    private static let taskDoneThrottle: TimeInterval = 8
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         PetView.log("ClaudePet 启动 feed-script-v2")
-        let size = Style.windowSize
+        let appSize = Style.canvasSize
         let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         // 默认安静地待在屏幕右下角
-        let origin = NSPoint(x: screen.maxX - size - 40, y: screen.minY + 40)
+        let origin = NSPoint(x: screen.maxX - appSize.width - 40, y: screen.minY + 40)
 
         let win = NSWindow(
-            contentRect: NSRect(origin: origin, size: CGSize(width: size, height: size)),
+            contentRect: NSRect(origin: origin, size: appSize),
             styleMask: .borderless,
             backing: .buffered,
             defer: false
@@ -849,14 +1925,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 刻意不用窗口级 hasShadow:它由系统按窗口位图生成,不跟随图层 transform 动画刷新,
         // 桌宠一跳/一摇旧阴影会残留成"第二个"重影。改用图层自带阴影(applyBaseShadow),随 transform 一起动。
         win.hasShadow = false
-        win.level = .floating // 浮在普通窗口之上
+        win.level = .statusBar // 浮在普通窗口之上,微信提示横幅不容易被盖住
         // 跨所有桌面/空间显示,并能浮在全屏应用之上
         win.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
         win.isMovableByWindowBackground = true // 整窗可拖拽
-        let petView = PetView(frame: NSRect(origin: .zero, size: CGSize(width: size, height: size)))
+        let petView = PetView(frame: NSRect(origin: .zero, size: appSize))
         win.contentView = petView
         win.makeKeyAndOrderFront(nil)
         window = win
+        self.petView = petView
 
         // 全局快捷键:取 Finder 选中项 → 扑过去吃 → 唤起分析(文件留在原位)。⌥⌘C 跑 claude,⌥⌘X 跑 codex(cx)。
         let mods = UInt32(cmdKey | optionKey)
@@ -868,15 +1945,83 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         PetView.log("热键注册 ⌥⌘C(claude)=\(okClaude) ⌥⌘X(codex)=\(okCodex)")
     }
+
+    @objc func showSettings(_ sender: Any?) {
+        if settingsWindowController == nil {
+            settingsWindowController = SettingsWindowController()
+        }
+        guard let settingsWindowController else { return }
+        settingsWindowController.showWindow(nil)
+        settingsWindowController.window?.center()
+        settingsWindowController.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    // MARK: 任务完成通知:外部 CLI 完成后 open "claudepet://done?tool=...&cwd=..." 唤起报喜横幅
+    // Claude Code 的 Stop 钩子 / Codex 的 notify 各自落到一条 open 命令;Info.plist 已声明 claudepet 协议,
+    // 系统据此把 GetURL 事件转给下方回调。只读 URL 参数、弹横幅,不碰任何文件。
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for url in urls where url.scheme == "claudepet" {
+            handleClaudePetURL(url)
+        }
+    }
+
+    private func handleClaudePetURL(_ url: URL) {
+        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        let action = url.host ?? components?.host ?? ""
+        guard action == "done" else { return }   // 目前只有 done 一种动作,host 留作未来扩展
+        guard Settings.receiveTaskDoneNotifications else {   // 设置里关掉就不打扰,直接忽略
+            PetView.log("任务完成提示已关闭,忽略 \(url.absoluteString)")
+            return
+        }
+        let items = components?.queryItems ?? []
+        let tool = items.first { $0.name == "tool" }?.value ?? ""
+        let cwd = items.first { $0.name == "cwd" || $0.name == "dir" }?.value
+        let task = items.first { $0.name == "task" }?.value
+        // 节流:同一(工具+目录)在 taskDoneThrottle 秒内只弹一次,连答多轮不连珠炮
+        let throttleKey = "\(tool)|\(cwd ?? "")"
+        let now = Date()
+        if let last = lastTaskDoneAt[throttleKey], now.timeIntervalSince(last) < AppDelegate.taskDoneThrottle {
+            PetView.log("任务完成提示节流(\(Int(AppDelegate.taskDoneThrottle))s 内重复),跳过 \(url.absoluteString)")
+            return
+        }
+        lastTaskDoneAt[throttleKey] = now
+        let message = AppDelegate.taskDoneMessage(tool: tool, cwd: cwd, task: task)
+        PetView.log("收到完成通知 \(url.absoluteString) → \(message)")
+        petView?.showTaskDoneHint(message: message)
+    }
+
+    /// 据工具名与工作目录拼报喜文案。抽成静态纯函数,便于 --notify-dryrun 离线核对。
+    static func taskDoneMessage(tool: String, cwd: String?, task: String?) -> String {
+        let who: String
+        switch tool.lowercased() {
+        case "codex", "cx": who = "Codex"
+        case "claude", "cc": who = "Claude"
+        default: who = tool   // 未知工具原样带出;空字符串走下方兜底
+        }
+        let label = who.isEmpty ? "完成" : who
+        // 有任务简介:直接"客户端 · 任务",一眼看清谁干完了哪桩(横幅高度会自适应换行)
+        if let task = task?.trimmingCharacters(in: .whitespacesAndNewlines), !task.isEmpty {
+            return "\(label) · \(task)"
+        }
+        // 退而求其次用目录名;再不行报个"该主公了"。文案表"答完一轮"而非整任务完成
+        if let cwd, !cwd.isEmpty {
+            let name = (cwd as NSString).lastPathComponent
+            if !name.isEmpty, name != "/" {
+                return who.isEmpty ? "答完了 · \(name)" : "\(who) 答完了 · \(name)"
+            }
+        }
+        return who.isEmpty ? "答完了,该主公了" : "\(who) 答完了,该主公了"
+    }
 }
 
 // MARK: - 离屏渲染自测
 // 不依赖屏幕、不触碰桌面隐私,把一帧图标渲染成 PNG,供本地核对外观。
 @MainActor
-private func renderSnapshot(to path: String, mouthOpen: CGFloat = 0, eyeLook: CGVector = CGVector(dx: 0, dy: 0), eyeMode: PetView.EyeMode = .normal) {
+private func renderSnapshot(to path: String, mouthOpen: CGFloat = 0, eyeLook: CGVector = CGVector(dx: 0, dy: 0), eyeMode: PetView.EyeMode = .normal, runPhase: Int = 0) {
     let dim: CGFloat = 256
     let view = PetView(frame: NSRect(x: 0, y: 0, width: dim, height: dim))
-    view.prepareSnapshot(withBackground: true, mouthOpen: mouthOpen, eyeLook: eyeLook, eyeMode: eyeMode)
+    view.prepareSnapshot(withBackground: true, mouthOpen: mouthOpen, eyeLook: eyeLook, eyeMode: eyeMode, runPhase: runPhase)
 
     let image = NSImage(size: NSSize(width: dim, height: dim))
     image.lockFocus()
@@ -939,6 +2084,14 @@ MainActor.assumeIsolated {
         exit(0)
     }
 
+    if let idx = arguments.firstIndex(of: "--render-run") {
+        // 自测模式:渲染跑步腿一帧,用法:--render-run [out.png] [1|2]
+        let out = idx + 1 < arguments.count ? arguments[idx + 1] : "/tmp/claudepet-run.png"
+        let phase = idx + 2 < arguments.count ? Int(arguments[idx + 2]) ?? 1 : 1
+        renderSnapshot(to: out, runPhase: phase)
+        exit(0)
+    }
+
     if let idx = arguments.firstIndex(of: "--feed-dryrun") {
         // 自测模式:打印投喂脚本(不执行),核对路径转义与命令拼装
         // 用法:--feed-dryrun <路径> [claude|codex],默认 claude
@@ -952,6 +2105,38 @@ MainActor.assumeIsolated {
         // 自测模式:打印当前 Finder 选中项路径后退出(会触发自动化授权),核对"取文件"这步
         let paths = PetView.finderSelectionPaths()
         print(paths.isEmpty ? "(无 Finder 选中项)" : paths.joined(separator: "\n"))
+        exit(0)
+    }
+
+    if arguments.contains("--wechat-detect-dryrun") {
+        // 自测模式:不触发桌宠提示,只打印当前微信未读探测状态,用于排查辅助功能权限和微信版本差异
+        print(PetView.weChatDetectionStatus())
+        exit(0)
+    }
+
+    if arguments.contains("--wechat-dump") {
+        // 临时诊断:把 Dock 与微信辅助功能树的真实字段 dump 到 /tmp/claudepet.log(命令行下若未授权则为空)
+        PetView.dumpWeChatAccessibilityTree()
+        print("已尝试导出微信探测详情到 /tmp/claudepet.log")
+        exit(0)
+    }
+
+    if let idx = arguments.firstIndex(of: "--notify-dryrun") {
+        // 自测模式:给定 claudepet:// URL,打印解析出的工具/目录与最终横幅文案,核对 URL 解析与文案拼装
+        // 用法:--notify-dryrun [claudepet://done?tool=codex&cwd=/path/to/repo],默认 claude
+        let raw = idx + 1 < arguments.count ? arguments[idx + 1] : "claudepet://done?tool=claude"
+        guard let url = URL(string: raw) else {
+            FileHandle.standardError.write(Data("无法解析 URL:\(raw)\n".utf8))
+            exit(1)
+        }
+        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        let items = components?.queryItems ?? []
+        let tool = items.first { $0.name == "tool" }?.value ?? ""
+        let cwd = items.first { $0.name == "cwd" || $0.name == "dir" }?.value
+        let task = items.first { $0.name == "task" }?.value
+        print("scheme=\(url.scheme ?? "(无)") action=\(url.host ?? components?.host ?? "(无)")")
+        print("tool=\(tool.isEmpty ? "(空)" : tool) cwd=\(cwd ?? "(无)") task=\(task ?? "(无)")")
+        print("横幅文案:\(AppDelegate.taskDoneMessage(tool: tool, cwd: cwd, task: task))")
         exit(0)
     }
 

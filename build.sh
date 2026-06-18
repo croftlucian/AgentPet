@@ -51,6 +51,18 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <true/>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
+    <!-- 自定义 URL 协议:Claude Code / Codex 完成任务后 open "claudepet://done?..." 唤起桌宠报喜 -->
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>com.claude.pet.feed</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>claudepet</string>
+            </array>
+        </dict>
+    </array>
 </dict>
 </plist>
 PLIST
@@ -63,8 +75,19 @@ exec /opt/homebrew/bin/codex --dangerously-bypass-approvals-and-sandbox "$@"
 SH
 chmod +x "$RESOURCES/cx"
 
-echo "==> ad-hoc 代码签名"
-codesign --force --sign - "$APP" 2>/dev/null && echo "（签名完成）" || echo "（签名跳过,不影响本机运行）"
+echo "==> code signing"
+SIGN_IDENTITY="${SIGN_IDENTITY:-}"
+if [[ -z "$SIGN_IDENTITY" ]]; then
+  SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | awk -F '"' '/Apple Development/ {print $2; exit}')"
+fi
+if [[ -z "$SIGN_IDENTITY" ]]; then
+  SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | awk -F '"' '/^[[:space:]]*[0-9]+\\)/ {print $2; exit}')"
+fi
+if [[ -n "$SIGN_IDENTITY" ]]; then
+  codesign --force --sign "$SIGN_IDENTITY" "$APP" 2>/dev/null && echo "(signed with identity: ${SIGN_IDENTITY})" || echo "(identity signing failed)"
+else
+  codesign --force --sign - "$APP" 2>/dev/null && echo "(ad-hoc signed)" || echo "(signing skipped)"
+fi
 
 echo "==> 完成:$APP"
 echo "    启动:open \"$APP\""
