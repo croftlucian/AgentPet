@@ -17,6 +17,9 @@ echo "==> 编译 Swift 源码(Swift 5 模式,规避严格并发误报)"
 swiftc -swift-version 5 -O \
   -module-cache-path "$CACHE" \
   "$ROOT/Sources/main.swift" \
+  "$ROOT/Sources/RemoteControl.swift" \
+  "$ROOT/Sources/FeishuRemote.swift" \
+  "$ROOT/Sources/TaskMonitor.swift" \
   -framework AppKit \
   -o "$BIN"
 

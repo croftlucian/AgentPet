@@ -1,7 +1,7 @@
 #!/bin/bash
 # ClaudePet 生命周期通知转发器
 # 把 Claude Code / Codex 的生命周期事件,转成一次
-#     open "claudepet://<phase>?tool=<claude|codex>&sid=<会话>&cwd=<目录>&task=<简介>"
+#     open "claudepet://<phase>?tool=<claude|codex>&sid=<会话>&cwd=<目录>&task=<简介>&tty=<终端设备>&ts=<事件时间戳>&pid=<会话进程pid>"
 # 唤起桌宠陪跑:开工(start)进专注态、等确认(waiting)弹横幅提醒、收工(done)庆祝。
 # 只读事件与会话记录、只 open 一个自定义 URL,绝不改动任何文件。
 #
@@ -10,6 +10,9 @@
 #       UserPromptSubmit: { "type":"command", "command":"/绝对路径/claudepet-notify.sh claude start" }
 #       Notification:     { "type":"command", "command":"/绝对路径/claudepet-notify.sh claude waiting" }
 #       Stop:             { "type":"command", "command":"/绝对路径/claudepet-notify.sh claude done" }
+#       StopFailure:      { "type":"command", "command":"/绝对路径/claudepet-notify.sh claude done" }
+#       注:Stop 只在正常答完时触发;网络/接口报错、重试耗尽那轮走 StopFailure(Claude Code 2.1.78+),
+#           两个都接 done,角标「跑 N」才不会卡到 10 分钟超时才清。本脚本按 argv 定相位,done 直接复用。
 #   Codex 0.140+ —— ~/.codex/config.toml 顶部开 codex_hooks = true,再用 inline [hooks](事件 JSON 从 stdin 传入):
 #       UserPromptSubmit → start / PermissionRequest → waiting / Stop → done
 #       command = ["/绝对路径/claudepet-notify.sh", "codex", "start"]   (waiting/done 同理)
@@ -56,12 +59,57 @@ case "$arg2" in
     ;;
 esac
 
+# 探测承载本会话的终端 tty:hook 自身的 stdin 多半是管道(读不到 tty),
+# 故沿父进程链上爬,取第一个挂着真实 tty 的祖先(即那个 shell / claude / codex 进程),
+# 规范成 /dev/ttysXXX 交给桌宠,点横幅时据此精确回到这一个终端窗口。拿不到则留空,退回整 App 唤前台。
+detect_tty() {
+  local pid="$$" tt ppid n=0
+  while [ "$n" -lt 12 ]; do
+    tt="$(ps -o tty= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+    case "$tt" in
+      ttys*|tty[0-9]*) printf '/dev/%s' "$tt"; return 0 ;;
+    esac
+    ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+    [ -z "$ppid" ] && return 0
+    [ "$ppid" -le 1 ] 2>/dev/null && return 0
+    pid="$ppid"
+    n=$((n + 1))
+  done
+  return 0
+}
+session_tty="$(detect_tty)"
+
+# 探测承载本会话的 claude/codex 进程 pid:沿父进程链上爬,取第一个 comm 基名为 claude/codex 的祖先。
+# hook 由 claude/codex 作为子进程调起,故其祖先链必含该会话进程。桌宠据此 kill -0 探活——
+# 进程一退出(硬退出/崩溃/被杀/关终端都不触发收工钩子)即清角标,不必干等 10 分钟超时兜底。
+# 拿不到则留空,桌宠退回纯超时兜底(老 hook 不带 pid 时同此,功能不哑火)。
+detect_session_pid() {
+  local pid="$$" comm bn ppid n=0
+  while [ "$n" -lt 16 ]; do
+    comm="$(ps -o comm= -p "$pid" 2>/dev/null)"
+    bn="${comm##*/}"                 # 取基名,去路径
+    bn="${bn#-}"                     # 去登录 shell 的前导 -
+    case "$bn" in
+      claude|codex) printf '%s' "$pid"; return 0 ;;
+    esac
+    ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+    [ -z "$ppid" ] && return 0
+    [ "$ppid" -le 1 ] 2>/dev/null && return 0
+    pid="$ppid"
+    n=$((n + 1))
+  done
+  return 0
+}
+session_pid="$(detect_session_pid)"
+
 # 用 python3 解析事件、(Claude)扒 transcript,拼出最终 URL
-url="$(printf '%s' "$raw" | CPET_TOOL="$tool" CPET_PHASE="$phase" python3 -c '
-import os, sys, json, urllib.parse
+url="$(printf '%s' "$raw" | CPET_TOOL="$tool" CPET_PHASE="$phase" CPET_TTY="$session_tty" CPET_SPID="$session_pid" python3 -c '
+import os, sys, json, time, urllib.parse
 
 tool = os.environ.get("CPET_TOOL", "claude")
 phase = os.environ.get("CPET_PHASE", "done")
+tty = os.environ.get("CPET_TTY", "")
+spid = os.environ.get("CPET_SPID", "")
 raw = sys.stdin.read()
 try:
     data = json.loads(raw) if raw.strip() else {}
@@ -129,8 +177,11 @@ if len(task) > 60:
     task = task[:60] + "…"
 
 q = urllib.parse.quote
-print("claudepet://%s?tool=%s&sid=%s&cwd=%s&task=%s"
-      % (q(phase), q(tool), q(sid, safe=""), q(cwd), q(task)))
+# ts:事件生成时刻(epoch 秒)。hook 一发即走、LaunchServices 不保证按序投递,桌宠据此对同一 sid 的乱序事件定序去旧。
+# pid:承载本会话的 claude/codex 进程 pid(可空),桌宠超时兜底前先 kill(0) 探活,进程退出即清角标。
+print("claudepet://%s?tool=%s&sid=%s&cwd=%s&task=%s&tty=%s&ts=%s%s"
+      % (q(phase), q(tool), q(sid, safe=""), q(cwd), q(task), q(tty, safe=""), time.time(),
+         ("&pid=" + q(spid, safe="")) if spid else ""))
 ')"
 
 # python3 缺失或异常导致 url 为空时,降级为只带 phase 与 tool,保证功能不哑火
