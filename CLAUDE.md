@@ -4,7 +4,7 @@
 
 ## 项目定位
 
-macOS 桌面宠物：在屏幕角落浮一个手绘的 Claude 星芒，安静呼吸；支持拖文件、全局快捷键、剪贴板、双击输入，把内容投喂给 Claude / Codex；同时陪跑 Claude Code / Codex 生命周期、提示微信/飞书未读、划词翻译和作息提醒；还能经 Telegram / 飞书远程遥控 cc/cx。核心运行逻辑在 `Sources/main.swift`（约 3580 行，AppKit），远程遥控独立成两个模块：`Sources/RemoteControl.swift`（Telegram，约 790 行）与 `Sources/FeishuRemote.swift`（飞书长连接，约 760 行），三文件由 `build.sh` 一起 `swiftc` 编进同一二进制。无 Xcode 工程、无 SwiftPM，构建完全由 `build.sh` 驱动。
+macOS 桌面宠物：在屏幕角落浮一个手绘的 Claude 星芒，安静呼吸；支持拖文件、全局快捷键、剪贴板、双击输入，把内容投喂给 Claude / Codex；同时陪跑 Claude Code / Codex 生命周期、提示微信/飞书未读、划词翻译和作息提醒；还能经 Telegram / 飞书远程遥控 cc/cx，并把远程每轮任务落盘成 JSONL、起本地仪表盘监控。核心运行逻辑在 `Sources/main.swift`（约 3690 行，AppKit），另有三个独立模块：`Sources/RemoteControl.swift`（Telegram 远程遥控，约 834 行）、`Sources/FeishuRemote.swift`（飞书长连接远程遥控，约 766 行）、`Sources/TaskMonitor.swift`（任务监控落盘 + 本地 HTTP 仪表盘，约 417 行），四文件由 `build.sh` 一起 `swiftc` 编进同一二进制。无 Xcode 工程、无 SwiftPM，构建完全由 `build.sh` 驱动。
 
 ## 构建与运行
 
@@ -40,6 +40,7 @@ BIN=./ClaudePet.app/Contents/MacOS/ClaudePet
 
 "$BIN" --finder-selection        # Finder 当前选中项，首次会触发自动化授权
 "$BIN" --wechat-detect-dryrun    # 微信未读探测状态
+"$BIN" --wechat-dump             # 临时诊断:把 Dock 与微信辅助功能树真实字段 dump 到 /tmp/claudepet.log(命令行未授权则空,定准规则后连同菜单项一并移除)
 "$BIN" --telegram-dryrun <claude|codex> <文本>  # 远程遥控:离线打印将执行的 cc/cx 命令(首轮+续接),不连网
 "$BIN" --telegram-stream-dryrun <claude|codex>  # 远程遥控:离线喂样本 JSONL,核对流式进度提取(进度行/最终正文/会话 id),不连网
 "$BIN" --telegram-live-test <claude|codex> <文本> # 远程遥控:真跑一轮打印实时进度(会真调 CLI、消耗额度),核对流式读不死锁
