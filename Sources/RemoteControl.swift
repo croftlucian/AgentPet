@@ -94,9 +94,9 @@ enum AgentRunner {
 
     /// 拼非交互命令(纯函数,便于 --telegram-dryrun 离线核对):
     /// claude → `-p <prompt> --output-format stream-json --verbose --dangerously-skip-permissions [--resume <sid>]`
-    /// codex  → `exec [resume <sid>] --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -C <cwd> -o <lastFile> <prompt>`
+    /// codex  → `exec [resume <sid>] --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check [-C <cwd>] -o <lastFile> <prompt>`
     /// 两端都按行吐 JSONL(逐行事件),供流式进度解析;claude 的 stream-json 必须配 --verbose 才出中间事件。
-    /// claude 没有 --cwd,靠调用方设 Process 工作目录;codex 走 -C。lastFile 仅 codex 用来回收末条消息。
+    /// claude 没有 --cwd,靠调用方设 Process 工作目录;codex 首轮走 -C,续接靠 Process 工作目录(resume 子命令不认 -C)。lastFile 仅 codex 用来回收末条消息。
     static func command(for tool: FeedTool, prompt: String, sessionID: String?, cwd: String, lastFile: String) -> [String] {
         switch tool {
         case .claude:
@@ -104,10 +104,14 @@ enum AgentRunner {
             if let sid = sessionID, !sid.isEmpty { args += ["--resume", sid] }
             return args
         case .codex:
+            // codex exec 认 -C/--cd,但其 resume 子命令不认(0.140.0 实测报 "unexpected argument '-C'",
+            // 续接轮必挂);故续接省略 -C,工作目录由调用方设的 Process.currentDirectoryURL 兜底。
             var args = ["exec"]
-            if let sid = sessionID, !sid.isEmpty { args += ["resume", sid] }
-            args += ["--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check",
-                     "-C", cwd, "-o", lastFile, prompt]
+            let resuming = (sessionID?.isEmpty == false)
+            if let sid = sessionID, resuming { args += ["resume", sid] }
+            args += ["--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check"]
+            if !resuming { args += ["-C", cwd] }
+            args += ["-o", lastFile, prompt]
             return args
         }
     }
