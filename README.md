@@ -3,7 +3,7 @@
 在屏幕角落浮一只手绘的 Claude 星芒,安静呼吸。把文件拖给它、按快捷键喂它、双击问它一句,它会"张嘴咀嚼",随后在终端唤起 `claude` / `codex` 交互会话替你干活;还能陪跑 Claude Code / Codex 的生命周期、提示微信飞书未读、随手翻译选中文字。
 
 - 纯本地、最少权限:看清靠星芒自带的描边光晕兜底,**不截屏、不读聊天正文**;本机投喂只读取、不改文件(唯一例外是下方「远程遥控」——它跳过权限确认、真能改文件跑命令,默认关闭、需自行开启)。
-- 核心逻辑在 `Sources/main.swift`(AppKit),远程遥控独立成 `Sources/RemoteControl.swift`(Telegram)与 `Sources/FeishuRemote.swift`(飞书),三文件由 `build.sh` 一起编进同一二进制;无 Xcode 工程、无 SwiftPM。
+- 核心逻辑在 `Sources/main.swift`(AppKit),远程遥控独立成 `Sources/RemoteControl.swift`(Telegram)与 `Sources/FeishuRemote.swift`(飞书),任务监控独立成 `Sources/TaskMonitor.swift`(落盘 + 本地仪表盘),四文件由 `build.sh` 一起编进同一二进制;无 Xcode 工程、无 SwiftPM。
 
 > 桌宠内右键「使用说明…」可随手查看精简版;本文是完整版。
 
@@ -128,6 +128,19 @@ notify = ["/绝对路径/hooks/claudepet-notify.sh", "codex"]
 
 ---
 
+## 任务监控
+
+把**远程遥控**每轮"问题→答案"连同发起人、墙钟耗时、CLI 自报花费 / token 落盘成 JSONL,并起一个本地仪表盘方便回看。**默认关闭**。
+
+- 开启后浏览器访问 `http://127.0.0.1:8722`(端口可在设置里改)查看任务记录与统计。
+- 数据落在 `~/Library/Application Support/com.claude.pet/monitor/tasks.jsonl`;用系统自带网络库**只监听 `127.0.0.1`**,纯本地、不对外。
+- 只覆盖**远程遥控**两条链路(Telegram / 飞书);本机投喂(拖放 / 快捷键 / 双击)交给终端、进程内拿不到答案与发起人,故不记录。
+- 设置里可填「前端目录」挂载自定义仪表盘页面;留空则用内置单文件页面,开箱即用、不依赖 Node 构建。
+
+> 在主设置窗顶部「任务监控」组开启,并设仪表盘端口与前端目录。
+
+---
+
 ## 作息脾气
 
 - **会饿会蔫**:久没人搭理就缩着身子、慢呼吸、垂眼;摸一下 / 喂一下即回血。
@@ -148,6 +161,7 @@ notify = ["/绝对路径/hooks/claudepet-notify.sh", "codex"]
 
 | 分组 | 可调项 |
 | --- | --- |
+| 任务监控 | 挂载监控系统(记录远程任务并起本地页面)、仪表盘端口、前端目录 |
 | 权限 | 完全磁盘访问、辅助功能的开启状态 + 一键前往系统设置开启(自动化首次用到时自动弹窗) |
 | 划词翻译 | 启用 ⌥⌘T 翻译 |
 | 互动 | 移动速度(扑食滑行)、手动颜色、自动适应环境色 |
@@ -168,6 +182,7 @@ open ClaudePet.app         # 启动桌宠
 ```
 
 - 要求 macOS 13.0+、已装 Xcode Command Line Tools(`swiftc`)。
+- 首次 `open ClaudePet.app` 启动会幂等把 `cc` / `cx` 命令简写写进 `~/.zshrc`(`claude` / `codex` 放飞版,跳过确认)——换台电脑装上桌宠就自带 `cc` / `cx`,新开终端即用;已有同名 alias 原样跳过、绝不改动。`cc` 是系统 C 编译器的标准名,故只做 shell alias、不装成 PATH 可执行,以免遮蔽 `/usr/bin/cc` 害了 `make` / `./configure`。
 - 刻意用 Swift 5 模式编译以规避严格并发误报。
 - 后台附件应用(`LSUIElement`):不占 Dock、不抢焦点,窗口浮于所有桌面/全屏之上。
 
@@ -203,6 +218,8 @@ BIN=./ClaudePet.app/Contents/MacOS/ClaudePet
 
 # 权限 / 探测排查
 "$BIN" --permissions-dryrun      # 打印完全磁盘访问 / 辅助功能的探测状态
+"$BIN" --install-aliases-dryrun  # 打印 cc/cx 写入 ~/.zshrc 的判定与将追加内容(只读不写)
+"$BIN" --install-aliases-selftest # cc/cx 写入逻辑离线自测(临时文件真写入,核对幂等/已有各场景)
 "$BIN" --finder-selection        # 打印 Finder 当前选中项(首次触发自动化授权)
 "$BIN" --wechat-detect-dryrun    # 打印微信未读探测状态
 ```

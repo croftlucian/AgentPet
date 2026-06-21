@@ -4,7 +4,7 @@
 
 ## 项目定位
 
-macOS 桌面宠物：在屏幕角落浮一个手绘的 Claude 星芒，安静呼吸；支持拖文件、全局快捷键、剪贴板、双击输入，把内容投喂给 Claude / Codex；同时陪跑 Claude Code / Codex 生命周期、提示微信/飞书未读、划词翻译和作息提醒；还能经 Telegram / 飞书远程遥控 cc/cx，并把远程每轮任务落盘成 JSONL、起本地仪表盘监控。核心运行逻辑在 `Sources/main.swift`（约 3690 行，AppKit），另有三个独立模块：`Sources/RemoteControl.swift`（Telegram 远程遥控，约 834 行）、`Sources/FeishuRemote.swift`（飞书长连接远程遥控，约 766 行）、`Sources/TaskMonitor.swift`（任务监控落盘 + 本地 HTTP 仪表盘，约 417 行），四文件由 `build.sh` 一起 `swiftc` 编进同一二进制。无 Xcode 工程、无 SwiftPM，构建完全由 `build.sh` 驱动。
+macOS 桌面宠物：在屏幕角落浮一个手绘的 Claude 星芒，安静呼吸；支持拖文件、全局快捷键、剪贴板、双击输入，把内容投喂给 Claude / Codex；同时陪跑 Claude Code / Codex 生命周期、提示微信/飞书未读、划词翻译和作息提醒；还能经 Telegram / 飞书远程遥控 cc/cx，并把远程每轮任务落盘成 JSONL、起本地仪表盘监控。核心运行逻辑在 `Sources/main.swift`（约 3836 行，AppKit），另有三个独立模块：`Sources/RemoteControl.swift`（Telegram 远程遥控，约 834 行）、`Sources/FeishuRemote.swift`（飞书长连接远程遥控，约 766 行）、`Sources/TaskMonitor.swift`（任务监控落盘 + 本地 HTTP 仪表盘，约 417 行），四文件由 `build.sh` 一起 `swiftc` 编进同一二进制。无 Xcode 工程、无 SwiftPM，构建完全由 `build.sh` 驱动。
 
 ## 构建与运行
 
@@ -47,6 +47,8 @@ BIN=./ClaudePet.app/Contents/MacOS/ClaudePet
 "$BIN" --feishu-pb-test                          # 远程遥控(飞书):长连接 protobuf 帧编解码往返(数据帧字段无损 + ping 帧字节),不连网
 "$BIN" --feishu-event-dryrun                     # 远程遥控(飞书):离线喂样本 im.message.receive_v1,核对解析(open_id/chat 类型/@剥离/文本),不连网
 "$BIN" --permissions-dryrun      # 打印完全磁盘访问 / 辅助功能的探测状态(裸 CLI 与 .app 的 TCC 身份不同,仅核检测逻辑)
+"$BIN" --install-aliases-dryrun   # cc/cx 写入 ~/.zshrc 的判定与将追加内容(只读真实 ~/.zshrc,不落盘;本机已配则显示无需改动)
+"$BIN" --install-aliases-selftest # cc/cx 写入逻辑离线自测(临时文件跑真写入,核对幂等/已有/注释/自定义各场景,全过退 0)
 ```
 
 改星芒、眼形、腿部、角标时用渲染快照出 PNG；改投喂时用 `--feed-dryrun` / `--ask-dryrun` 核对 shell 转义；改陪跑协议时用 `hooks/claudepet-notify.sh` 的 `CLAUDEPET_NOTIFY_DRYRUN=1` 和 `--notify-dryrun` 双向核对。呼吸、跳、悬停、横幅点击、双击弹框、会话角标实时刷新等运行时动画离屏快照测不到，只能实跑观感。
@@ -64,6 +66,7 @@ BIN=./ClaudePet.app/Contents/MacOS/ClaudePet
 - **权限组只读状态 + 跳转**：app 无法给自己授权,「权限」组只显示完全磁盘访问(探测 `~/Library/Application Support/com.apple.TCC/TCC.db` 是否可读,见 `PetView.hasFullDiskAccess`)、辅助功能(`AXIsProcessTrusted`)的状态,并用 `x-apple.systempreferences:...?Privacy_AllFiles|Privacy_Accessibility` 一键跳到系统设置;`windowDidBecomeKey` 在切回窗口时重新探测刷新。完全磁盘访问是远程遥控 cc/cx 进受保护目录的关键(子进程继承桌宠的 TCC 授权)。
 - **IM 未读只看提示面**：`imTargets` 泛化微信/飞书，默认关闭；轮询 Dock 辅助功能树和窗口标题，判断是否有未读和粗略数量，不读取数据库和消息正文。
 - **投喂入口归一**：拖放、`⌥⌘C`、`⌥⌘X`、`⌥⌘V`、双击/菜单输入最终都进入 `PetView.analyze(...)` 或 `PetView.analyzeText(...)`，由 `FeedTool` 决定 Claude / Codex 命令候选和 prompt 文案。
+- **cc/cx 随桌宠落地用户 shell**：`ShellAliasInstaller.ensure(...)` 在 `applicationDidFinishLaunching` 末尾幂等把 `cc`/`cx` alias 写进 `~/.zshrc`，让“换台电脑装上桌宠”就自带 `cc`/`cx`、无需手动配；首次写入经 `PetView.flashInfo` 闪横幅告知（本机已配则零改动、不弹）。**只做 alias、绝不装成 PATH 可执行**：`cc` 是系统 C 编译器（`/usr/bin/cc`）的标准名，做成可执行文件丢进 PATH 靠前目录会遮蔽它、令 `make`/`./configure`/原生编译错走到 `claude`；alias 只在交互式 shell 顶层展开，不污染脚本与编译。判定按整行去空白后 `alias <名>=` 前缀、注释行不算，**已有定义一律跳过、绝不覆盖主公现有别名**。离线自测：`--install-aliases-selftest`（临时文件跑真写入）、`--install-aliases-dryrun`（只读真实 `~/.zshrc`）。
 - **全局热键中心化分发**：`GlobalHotKey` 只安装一个 Carbon application handler，用 keyCode 作为 hotKeyID 查表分发。不要给每个热键各装一个 handler，否则事件链可能被先返回 `noErr` 的处理器吃掉。
 - **通知协议入口在 AppDelegate**：`AppDelegate.application(_:open:)` 接收 `claudepet://start|waiting|done?...`，`handleClaudePetURL(_:)` 解析 `tool`、`sid`、`cwd`、`task`，节流只抑制横幅，不抑制会话状态和角标更新。
 - **远程遥控独立成模块**：`Sources/RemoteControl.swift` 接 Telegram。`TelegramBot` long polling 收消息当 prompt 喂给 `AgentRunner`（非交互跑 cc/cx，自带跳过权限确认参数；claude 走 `-p … --output-format stream-json --verbose [--resume sid]`，codex 走 `exec [resume sid] … --json --dangerously-bypass-approvals-and-sandbox -C cwd -o lastFile`），回话回传聊天；cc/cx 各占一个独立 bot、各维持一条可续接会话，聊天里 `/cd`、`/pwd`、`/new`、`/help` 控目录与上下文。`RemoteControl.shared.reload()` 按 `Settings.remoteEnabled` + token 起停 bot；配置走 `RemoteControlWindowController` 独立小窗（右键「远程遥控(Telegram)…」进）。本模块**不直接持有 `PetView`**：远程收到/答完经 `onActivity` 闭包（AppDelegate 注入）回桌宠 `remoteActivity(...)` 闪横幅，故改桌宠外观无需动这里。chat id 白名单挡陌生人；token 只落 `UserDefaults`、不入仓库。
@@ -104,6 +107,6 @@ BIN=./ClaudePet.app/Contents/MacOS/ClaudePet
 - `PetView.log(_:)` 追加到 `/tmp/claudepet.log`，属于临时诊断手段；清理日志时要连同各 `Self.log(...)` 调用一起看。
 - `Resources/claude-icon.png` 不参与运行时渲染；星芒由代码绘制。
 - `draw(_:)` 只服务 `--render-*` 离屏快照，运行时画面由图层显示。
-- `cc` / `cx` 包装命令由 `build.sh` 写入 app resources；alias 在非交互脚本里不可用，所以不要把投喂链路改回依赖 shell alias。
+- `cc` / `cx` 包装命令由 `build.sh` 写入 app resources；alias 在非交互脚本里不可用，所以不要把投喂链路改回依赖 shell alias。这套是给 app 内部投喂用的可执行；另有一套给主公终端用的同名 alias，由 `ShellAliasInstaller` 启动时幂等写进 `~/.zshrc`（见架构要点），两套别混。
 - `--translate-dryrun` 会真实调用 Claude CLI；没有 CLI 或命令失败时会打印失败信息。
 - README 是面向使用者的完整说明；本文件是面向开发者的架构和验证速查。两者涉及命令行自测、快捷键、hook 语义时需要同步更新。

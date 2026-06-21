@@ -827,6 +827,11 @@ final class PetView: NSView {
         }
     }
 
+    /// 主动信息横幅(force 绕过免打扰):首次把 cc/cx 写进 ~/.zshrc 后告知主公;复用统一横幅出口。
+    func flashInfo(_ message: String) {
+        flashNotice(message, accent: Style.orange, force: true)
+    }
+
     /// 通用通知观感:顶部弹横幅(accent 决定边框色)+ 发光 + 跳 + 摇 + 眯眼笑,定时复位。
     /// 微信未读与任务完成共用,只是文案与强调色不同——避免两套重复的提示逻辑。
     /// actionCwd:横幅可点回现场的目录(nil 则纯展示);actionTty:精确回窗口用的终端设备;force:主公主动触发(翻译/测试),绕过免打扰。
@@ -2343,6 +2348,7 @@ final class PetView: NSView {
       • 把文件/目录拖到桌宠身上 → 喂给 Claude
       • 双击桌宠,或右键"问 Claude…/问 Codex…" → 弹框打字或贴报错
       • 投喂时桌宠会扑到鼠标处张嘴嚼一口,随后在终端开会话
+      • 优先用 cc/cx(官方命令+跳过确认);首次启动自动写进 ~/.zshrc,新开终端即用
 
     — 鼠标互动 —
       • 悬停 → 眯眼笑、鼓起来、发光
@@ -2353,14 +2359,21 @@ final class PetView: NSView {
     — 陪跑(Claude Code · Codex,需接入通知钩子) —
       • 开工进专注态、等你确认时横幅催点头、收工报喜
       • 右上角角标:正在执行显「跑N」、Claude 停下等你回答显「等N」(琥珀);答完一轮即消
+      • 报错/网络重试那轮也算收工(钩子接 StopFailure);客户端崩了按进程存活清角标
       • 点"报喜/等确认"横幅 → 把终端唤回前台(或用访达打开目录)
 
-    — 远程遥控(Telegram,默认关) —
-      • 手机给 bot 发话 → 桌宠在本机非交互跑 cc/cx,干完回话回传聊天
-      • cc/cx 各占一个独立 bot、各记上下文;聊天里 /cd · /pwd · /new · /help
+    — 远程遥控(Telegram / 飞书,默认关) —
+      • 手机给 bot 发话 → 桌宠在本机非交互跑 cc/cx,干完回话回传聊天(带实时进度)
+      • cc/cx 各占一个独立 bot/应用、各记上下文;聊天里 /cd · /pwd · /new · /help
       • 收到指令/答完一轮会闪横幅,远程有动静在电脑前也看得见
-      • 注意:跳过权限确认、真能改文件跑命令,务必设 chat id 白名单
-      • 右键"远程遥控(Telegram)…"填两个 token 与白名单后启用
+      • 注意:跳过权限确认、真能改文件跑命令,务必设白名单只给自己用
+      • 飞书私聊直接发、群里需 @机器人(仅国内版 open.feishu.cn 支持长连接)
+      • 右键"远程遥控(Telegram / 飞书)…"填 token/应用凭证与白名单后启用
+
+    — 任务监控(默认关) —
+      • 把远程遥控每轮"问题→答案"连同耗时/花费落盘,并起本地仪表盘
+      • 开启后浏览器访问 http://127.0.0.1:8722 看记录(端口可在设置改)
+      • 只覆盖远程两条链路;本机投喂交给终端、拿不到答案故不记
 
     — 作息脾气 —
       • 久没人理会蔫(摸一下/喂一下回血)
@@ -2371,7 +2384,7 @@ final class PetView: NSView {
       • 免打扰:一键静音所有被动提示(翻译/测试不受影响)
 
     — 设置(右键"设置...") —
-      权限(完全磁盘访问/辅助功能,看状态+一键去开)· 移动速度 ·
+      任务监控 · 权限(完全磁盘访问/辅助功能,看状态+一键去开)· 移动速度 ·
       颜色/自动配色 · 划词翻译 · 陪跑各项 · 作息脾气 ·
       通知/免打扰 · 停靠角 · 开机自启
 
@@ -3172,6 +3185,70 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 }
 
+/// 把 cc/cx 命令简写幂等地确保进 ~/.zshrc——让"换台电脑装上桌宠"就自带 cc/cx,不必每台手动配别名。
+/// 形式只能是 alias、不能装成 PATH 可执行:cc 是系统 C 编译器(/usr/bin/cc)的标准名,做成可执行文件丢进
+/// PATH 靠前目录会遮蔽 /usr/bin/cc,令 make / ./configure / 原生模块编译全部错走到 claude 上;alias 只在
+/// 交互式 shell 顶层展开,不污染脚本与编译,故安全。已有定义一律尊重、跳过,绝不改动主公现有别名。
+@MainActor
+enum ShellAliasInstaller {
+    /// 要确保存在的命令简写,与 build.sh 写入 app 的 cc/cx 包装、主公 .zshrc 现有定义保持一致(放飞版:跳过确认)。
+    static let entries: [(name: String, line: String)] = [
+        ("cc", #"alias cc="claude --dangerously-skip-permissions""#),
+        ("cx", #"alias cx="codex --dangerously-bypass-approvals-and-sandbox""#),
+    ]
+
+    struct Outcome {
+        let path: String        // 目标 rc 文件
+        let existed: [String]   // 已有定义、跳过的简写名
+        let added: [String]     // 本次(将)追加的简写名;空 = 无需改动
+        let appendText: String  // (将)追加到文件末尾的文本块(含来源注释);无追加则为空串
+    }
+
+    /// 幂等确保 ~/.zshrc 含 cc/cx alias。dryRun 只判定不落盘;path 可注入(供自测指向临时文件)。
+    @discardableResult
+    static func ensure(dryRun: Bool, path overridePath: String? = nil) -> Outcome {
+        let path = overridePath
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".zshrc").path
+        let existing = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
+        let lines = existing.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+
+        // 判定某简写是否已有"生效的"定义:整行去空白后以 alias <name>= 开头,注释行不算。
+        func defined(_ name: String) -> Bool {
+            let prefix = "alias \(name)="
+            return lines.contains { raw in
+                let t = raw.trimmingCharacters(in: .whitespaces)
+                return !t.hasPrefix("#") && t.hasPrefix(prefix)
+            }
+        }
+
+        var existed: [String] = []
+        var addedNames: [String] = []
+        var addedLines: [String] = []
+        for entry in entries {
+            if defined(entry.name) { existed.append(entry.name) }
+            else { addedNames.append(entry.name); addedLines.append(entry.line) }
+        }
+
+        var appendText = ""
+        if !addedLines.isEmpty {
+            appendText = "\n# ClaudePet 桌宠自动添加:cc/cx 命令简写(放飞版,跳过确认)\n"
+                + addedLines.joined(separator: "\n") + "\n"
+            if !dryRun {
+                var next = existing
+                if !next.isEmpty && !next.hasSuffix("\n") { next += "\n" }  // 原文件不以换行结尾时先补,避免粘行
+                next += appendText
+                do {
+                    try next.write(toFile: path, atomically: true, encoding: .utf8)
+                    PetView.log("shell alias 写入 \(path):新增 \(addedNames.joined(separator: ","))")
+                } catch {
+                    PetView.log("shell alias 写入失败 \(path):\(error)")
+                }
+            }
+        }
+        return Outcome(path: path, existed: existed, added: addedNames, appendText: appendText)
+    }
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow!
@@ -3240,6 +3317,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // 任务监控:按"挂载监控系统"开关起停内嵌 HTTP 服务(默认关闭,不启动则零开销)。
         TaskMonitor.reload()
+
+        // 首次在新机器上启动:幂等把 cc/cx 命令简写写进 ~/.zshrc(已有则跳过、绝不动主公现有定义),
+        // 让"换台电脑装上桌宠"就自带 cc/cx;新开终端或 source ~/.zshrc 后生效。
+        let aliasOutcome = ShellAliasInstaller.ensure(dryRun: false)
+        if !aliasOutcome.added.isEmpty {
+            petView.flashInfo("已为你装好 \(aliasOutcome.added.joined(separator: "/")) 命令,新开终端即可用")
+        }
     }
 
     @objc private func handleDockCornerDidChange(_ notification: Notification) {
@@ -3394,6 +3478,61 @@ private func renderSnapshot(to path: String, mouthOpen: CGFloat = 0, eyeLook: CG
 
 // MARK: - 入口
 // 程序启动即处于主线程,assumeIsolated 让顶层安全进入主 actor 上下文。
+
+/// cc/cx 写入逻辑的离线自测:在临时文件上真跑写入,核对幂等与各类已有定义场景;不碰真实 ~/.zshrc。
+@MainActor
+func runInstallAliasesSelfTest() -> Bool {
+    let fm = FileManager.default
+    let dir = NSTemporaryDirectory()
+    var pass = true
+    func check(_ cond: Bool, _ desc: String) {
+        print((cond ? "PASS " : "FAIL ") + desc); if !cond { pass = false }
+    }
+    func freshFile(_ name: String, _ content: String?) -> String {
+        let p = (dir as NSString).appendingPathComponent(name)
+        try? fm.removeItem(atPath: p)
+        if let content { try? content.write(toFile: p, atomically: true, encoding: .utf8) }
+        return p
+    }
+    func read(_ p: String) -> String { (try? String(contentsOfFile: p, encoding: .utf8)) ?? "" }
+
+    // 场景1:文件不存在 → 追加 cc、cx 两行
+    let p1 = freshFile("claudepet-alias-st1.zshrc", nil)
+    let r1 = ShellAliasInstaller.ensure(dryRun: false, path: p1)
+    check(r1.added == ["cc", "cx"] && r1.existed.isEmpty, "文件不存在 → 追加 cc、cx")
+    let body1 = read(p1)
+    check(body1.contains(#"alias cc="claude --dangerously-skip-permissions""#)
+        && body1.contains(#"alias cx="codex --dangerously-bypass-approvals-and-sandbox""#),
+        "文件不存在 → 落盘两行 alias")
+
+    // 场景2:对场景1产物复跑 → 幂等,不新增、内容不变
+    let before2 = read(p1)
+    let r2 = ShellAliasInstaller.ensure(dryRun: false, path: p1)
+    check(r2.added.isEmpty && r2.existed == ["cc", "cx"], "复跑 → 幂等不重复")
+    check(read(p1) == before2, "复跑 → 文件内容一字不变")
+
+    // 场景3:只有 cc → 只补 cx
+    let p3 = freshFile("claudepet-alias-st3.zshrc", "alias cc=\"claude --dangerously-skip-permissions\"\n")
+    let r3 = ShellAliasInstaller.ensure(dryRun: false, path: p3)
+    check(r3.existed == ["cc"] && r3.added == ["cx"], "已有 cc → 只补 cx")
+
+    // 场景4:cc 被注释掉 → 视为未定义,补 cc 与 cx
+    let p4 = freshFile("claudepet-alias-st4.zshrc", "# alias cc=\"old\"\n")
+    let r4 = ShellAliasInstaller.ensure(dryRun: false, path: p4)
+    check(r4.added.contains("cc") && r4.added.contains("cx"), "注释掉的 cc 不算 → 补 cc、cx")
+
+    // 场景5:主公自定义了 cc(不同定义) → 尊重不覆盖,只补 cx
+    let p5 = freshFile("claudepet-alias-st5.zshrc", "alias cc=\"claude\"\n")
+    let r5 = ShellAliasInstaller.ensure(dryRun: false, path: p5)
+    check(r5.existed.contains("cc") && !r5.added.contains("cc"), "自定义 cc → 尊重不覆盖")
+    check(read(p5).contains("alias cc=\"claude\"") && r5.added == ["cx"], "自定义 cc → 原定义保留、只补 cx")
+
+    for n in ["claudepet-alias-st1.zshrc", "claudepet-alias-st3.zshrc", "claudepet-alias-st4.zshrc", "claudepet-alias-st5.zshrc"] {
+        try? fm.removeItem(atPath: (dir as NSString).appendingPathComponent(n))
+    }
+    return pass
+}
+
 MainActor.assumeIsolated {
     let arguments = CommandLine.arguments
     if let idx = arguments.firstIndex(of: "--render-test") {
@@ -3680,6 +3819,21 @@ MainActor.assumeIsolated {
         print("完全磁盘访问:\(PetView.hasFullDiskAccess() ? "已开启" : "未开启")")
         print("辅助功能:\(PetView.accessibilityTrusted(prompt: false) ? "已开启" : "未开启")")
         exit(0)
+    }
+
+    if arguments.contains("--install-aliases-dryrun") {
+        // 自测:只读真实 ~/.zshrc,打印 cc/cx 判定与将追加的内容,不落盘。本机已配则应显示"无需改动"。
+        let r = ShellAliasInstaller.ensure(dryRun: true)
+        print("目标文件:\(r.path)")
+        print("已存在(跳过):\(r.existed.isEmpty ? "无" : r.existed.joined(separator: ", "))")
+        print("将追加:\(r.added.isEmpty ? "无(无需改动)" : r.added.joined(separator: ", "))")
+        if !r.appendText.isEmpty { print("追加内容:\(r.appendText)", terminator: "") }
+        exit(0)
+    }
+
+    if arguments.contains("--install-aliases-selftest") {
+        // 自测:临时文件上真跑写入,核对幂等与各类已有定义场景;不碰真实 ~/.zshrc。全过打印 PASS、退 0。
+        exit(runInstallAliasesSelfTest() ? 0 : 1)
     }
 
     let app = NSApplication.shared
