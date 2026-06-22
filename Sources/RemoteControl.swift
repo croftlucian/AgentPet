@@ -266,7 +266,7 @@ enum AgentRunner {
     }
 
     /// codex --json:thread.started 带会话 id(字段是 thread_id,旧版本写 thread.id,这里只认实测的 thread_id);
-    /// item.started 报发起的命令,item.completed 收回话(兼最终正文)。
+    /// item.started 报发起的命令,item.completed 收回话(兼最终正文),turn.completed 带本轮 token 计量。
     private static func parseCodexEvent(_ obj: [String: Any]) -> [StreamEvent] {
         switch obj["type"] as? String {
         case "thread.started":
@@ -278,6 +278,15 @@ enum AgentRunner {
             return (obj["item"] as? [String: Any]).map { codexItemProgress($0, started: true) } ?? []
         case "item.completed":
             return (obj["item"] as? [String: Any]).map { codexItemProgress($0, started: false) } ?? []
+        case "turn.completed":
+            guard let usage = obj["usage"] as? [String: Any] else { return [] }
+            var m = AgentMetrics()
+            let input = usage["input_tokens"] as? Int ?? 0
+            let output = usage["output_tokens"] as? Int ?? 0
+            let reasoningOutput = usage["reasoning_output_tokens"] as? Int ?? 0
+            m.inputTokens = input
+            m.outputTokens = output + reasoningOutput
+            return [.metrics(m)]
         default:
             return []
         }

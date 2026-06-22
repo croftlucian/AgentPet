@@ -12,12 +12,13 @@
 import AppKit
 import Network
 
-/// 一轮调用的计量:墙钟时长之外,claude 的 result 事件还带 CLI 自报的时长 / 花费 / token,能拿则拿(codex 暂无,留 nil)。
+/// 一轮调用的计量:墙钟时长之外,Claude 的 result 事件带 CLI 自报的时长 / 花费 / token;
+/// Codex 的 turn.completed 事件带 token,但本地 JSONL 不含可直接落盘的美元花费。
 struct AgentMetrics {
     var cliDurationMs: Int?     // claude result.duration_ms
     var costUSD: Double?        // claude result.total_cost_usd
-    var inputTokens: Int?       // claude result.usage.input_tokens(含 cache)
-    var outputTokens: Int?      // claude result.usage.output_tokens
+    var inputTokens: Int?       // Claude/Codex 输入 token
+    var outputTokens: Int?      // Claude/Codex 输出 token(含推理输出)
     var numTurns: Int?          // claude result.num_turns
 }
 
@@ -36,8 +37,8 @@ struct TaskRecord: Codable {
     let durationMs: Int         // 墙钟时长(从收到到答完)
     let cliDurationMs: Int?     // CLI 自报时长(仅 claude)
     let costUSD: Double?        // 本轮花费美元(仅 claude)
-    let inputTokens: Int?       // 输入 token(仅 claude)
-    let outputTokens: Int?      // 输出 token(仅 claude)
+    let inputTokens: Int?       // 输入 token(Claude/Codex 能拿则填)
+    let outputTokens: Int?      // 输出 token(Claude/Codex 能拿则填)
     let numTurns: Int?          // 内部回合数(仅 claude)
     let status: String          // ok | timeout | error
     let sessionID: String?      // 续接会话 id

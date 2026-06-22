@@ -3738,7 +3738,7 @@ MainActor.assumeIsolated {
                 #"{"type":"item.started","item":{"id":"i0","type":"command_execution","command":"/bin/zsh -lc 'ls -la'","status":"in_progress"}}"#,
                 #"{"type":"item.completed","item":{"id":"i0","type":"command_execution","command":"/bin/zsh -lc 'ls -la'","exit_code":0,"status":"completed"}}"#,
                 #"{"type":"item.completed","item":{"id":"i1","type":"agent_message","text":"主公,目录里有 3 个文件。"}}"#,
-                #"{"type":"turn.completed","usage":{}}"#,
+                #"{"type":"turn.completed","usage":{"input_tokens":24763,"cached_input_tokens":24448,"output_tokens":122,"reasoning_output_tokens":7}}"#,
             ]
         }
         print("流式进度 dryrun(\(tool.label)):逐行喂 parseStreamLine,核对进度提取(不连网)")
@@ -3750,7 +3750,8 @@ MainActor.assumeIsolated {
                 case .progress(let p): print("  进度│ \(p)")
                 case .finalText(let t): finalText = t
                 case .session(let s): sid = s
-                case .metrics(let m): print("  计量│ 时长 \(m.cliDurationMs ?? -1)ms 花费 $\(m.costUSD ?? 0)")
+                case .metrics(let m):
+                    print("  计量│ 时长 \(m.cliDurationMs ?? -1)ms 花费 $\(m.costUSD ?? 0) 输入 \(m.inputTokens ?? -1) 输出 \(m.outputTokens ?? -1)")
                 }
             }
         }

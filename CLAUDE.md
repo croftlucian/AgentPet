@@ -13,6 +13,8 @@ macOS 桌面宠物：在屏幕角落浮一个手绘的 Claude 星芒，安静呼
 open ClaudePet.app         # 启动桌宠
 ```
 
+每次改完桌宠本体后必须自动完成发布到本机应用目录:先运行 `./build.sh`,再退出正在运行的 `/Applications/ClaudePet.app`,用新生成的 `./ClaudePet.app` 覆盖 `/Applications/ClaudePet.app`,最后重新 `open /Applications/ClaudePet.app`。验证时优先跑 `/Applications/ClaudePet.app/Contents/MacOS/ClaudePet ...`,确保测到的是主公实际使用的应用包,不是仓库里的临时构建产物。
+
 构建用 `swiftc -swift-version 5 -O` 并显式链接 `AppKit`：刻意锁定 Swift 5 模式以规避严格并发误报。改动并发、actor、入口初始化相关代码时必须保持这一约束，不要擅自升级到 Swift 6 模式。
 
 `build.sh` 还会写入 `Info.plist`、登记 `claudepet://` URL 协议，并在 `ClaudePet.app/Contents/Resources/` 下生成 `cc` / `cx` 包装命令：投喂优先走这些包装命令，再回退到系统里的 `claude` / `codex`。
