@@ -3813,6 +3813,25 @@ MainActor.assumeIsolated {
         exit(0)
     }
 
+    if arguments.contains("--bot-setup-dryrun") {
+        // 自测模式:用临时配置文件跑远程 Bot 个性化初始化状态机,不连网、不碰真实配置。
+        let ok = RemoteBotSetup.runSelfTest()
+        print("远程 Bot 个性化设置 dryrun:\(ok ? "PASS" : "FAIL")")
+        exit(ok ? 0 : 2)
+    }
+
+    if arguments.contains("--announcement-dryrun") {
+        // 自测模式:只打印新功能公告的待推送目标,不发送、不打印 token。
+        let targets = RemoteFeatureAnnouncement.pendingTargets()
+        print("远程公告版本:\(RemoteFeatureAnnouncement.version)")
+        if targets.isEmpty {
+            print("待推送目标:无")
+        } else {
+            for t in targets { print("待推送:\(t.platform)/\(t.toolID) recipient=\(t.recipientID)") }
+        }
+        exit(0)
+    }
+
     if arguments.contains("--permissions-dryrun") {
         // 自测模式:打印「权限」组探测到的状态,核对检测逻辑跑得通。
         // 注意:命令行跑的是裸可执行,TCC 身份与 /Applications 里的 .app 不同,状态仅反映本次调用进程,不代表桌宠本体。

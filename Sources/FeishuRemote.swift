@@ -537,7 +537,7 @@ final class FeishuLongConn: NSObject, URLSessionWebSocketDelegate {
 // MARK: - 飞书机器人:把来信喂给 cc/cx,回话与进度回传
 
 /// 一个飞书机器人:绑定一个应用 + 一个 tool(cc 或 cx)。长连接收消息 → 解析/去重/白名单/指令 → 喂 AgentRunner → 回话。
-/// 按"回信目标"(私聊=发送者 open_id,群=chat_id)各建一份 ChatContext:同一会话串行续接,不同会话并行互不阻塞。
+/// 按远程发送者建 ChatContext:私聊按 open_id,群里按 chat_id + open_id,同一群不同用户互不串上下文。
 final class FeishuBot {
     private let tool: FeedTool
     private let home: String
@@ -600,15 +600,24 @@ final class FeishuBot {
         guard !text.isEmpty else { return }
 
         let ctx = context(for: inc)
-        if text.hasPrefix("/") {
-            handleCommand(text, inc: inc, ctx: ctx)
+        switch RemoteBotSetup.handle(platform: "feishu", remoteUserID: inc.senderOpenID,
+                                     botID: RemoteBotSetup.botID(for: tool), toolLabel: tool.label,
+                                     incoming: text) {
+        case .reply(let reply, let resetSession):
+            if resetSession { ctx.setSessionID(nil) }
+            replyAsync(inc, reply)
             return
+        case .proceed(let personalizedPrompt):
+            if text.hasPrefix("/") {
+                handleCommand(text, inc: inc, ctx: ctx)
+                return
+            }
+            guard ctx.tryBegin() else {
+                replyAsync(inc, "上一条还在跑,等它答完再发哈。")
+                return
+            }
+            runAgent(prompt: personalizedPrompt, originalPrompt: text, inc: inc, ctx: ctx)
         }
-        guard ctx.tryBegin() else {
-            replyAsync(inc, "上一条还在跑,等它答完再发哈。")
-            return
-        }
-        runAgent(prompt: text, inc: inc, ctx: ctx)
     }
 
     private func isDuplicate(_ id: String) -> Bool {
@@ -619,9 +628,9 @@ final class FeishuBot {
         return false
     }
 
-    /// 取该会话的状态,没有就按默认目录新建。会话键:私聊按发送者、群按 chat_id。
+    /// 取该会话的状态,没有就按默认目录新建。会话键:私聊按发送者、群按 chat_id + 发送者。
     private func context(for inc: FeishuIncoming) -> ChatContext {
-        let key = inc.chatType == "p2p" ? "u:" + inc.senderOpenID : "c:" + inc.chatID
+        let key = inc.chatType == "p2p" ? "u:" + inc.senderOpenID : "c:" + inc.chatID + ":u:" + inc.senderOpenID
         if let ctx = contexts[key] { return ctx }
         let tag = tool == .codex ? "cx" : "cc"
         let ctx = ChatContext(tool: tool, cwd: home, label: "claudepet.feishu.\(tag).\(key)")
@@ -657,6 +666,9 @@ final class FeishuBot {
             /cd <路径>  切换工作目录(并开新会话)
             /pwd        看当前目录
             /new        开新会话(清上下文)
+            /setup      重新设置当前 Bot
+            /profile    查看当前 Bot 设置
+            /reset      清空当前 Bot 设置并重新引导
             /help       这条帮助
             当前目录:\(ctx.cwd)
             """)
@@ -669,12 +681,12 @@ final class FeishuBot {
 
     /// 把消息当 prompt 喂给 cc/cx:派到该会话串行队列后台跑。流程对齐 Telegram:
     /// 桌宠开跑 → 占一条进度消息 → 边跑边原地编辑刷新(限次)→ 写回会话 id、解忙 → 收尾进度 + 另发最终正文 → 桌宠收工。
-    private func runAgent(prompt: String, inc: FeishuIncoming, ctx: ChatContext) {
+    private func runAgent(prompt: String, originalPrompt: String, inc: FeishuIncoming, ctx: ChatContext) {
         let tool = self.tool
         ctx.queue.async { [weak self] in
             guard let self = self else { return }
             DispatchQueue.main.async { self.onActivity(tool, "start", nil) }
-            PetView.log("飞书[\(tool.label)] 收到 \(prompt.count) 字,开跑")
+            PetView.log("飞书[\(tool.label)] open_id \(inc.senderOpenID) 收到 \(originalPrompt.count) 字,开跑")
             let startedAt = Date()   // 墙钟计时起点:供任务监控算运行时长
 
             let panelID = self.reply(inc, "🤖 收到,开跑…")
@@ -696,7 +708,7 @@ final class FeishuBot {
             // 任务监控:落盘本轮"问题→答案"连同发起人(飞书 open_id)、耗时、花费(开关关时内部跳过)。
             DispatchQueue.main.async {
                 TaskMonitor.record(source: "feishu", tool: tool, initiatorID: inc.senderOpenID,
-                                   initiatorName: inc.senderOpenID, cwd: snap.cwd, question: prompt,
+                                   initiatorName: inc.senderOpenID, cwd: snap.cwd, question: originalPrompt,
                                    answer: reply.text, startedAt: startedAt, endedAt: Date(),
                                    status: reply.status, sessionID: reply.sessionID, metrics: reply.metrics)
             }

@@ -380,6 +380,454 @@ final class ProgressPanel {
     }
 }
 
+// MARK: - 远程 Bot 个性化初始化
+
+/// 远程 Bot 的个性化记录。隔离维度固定为 platform + remoteUserID + botID:
+/// 同一个人在 cc/cx、Telegram/飞书之间互不串设置,同一群里的不同发送者也互不影响。
+struct RemoteBotProfileRecord: Codable {
+    var platform: String
+    var remoteUserID: String
+    var botID: String
+    var botName: String
+    var userTitle: String
+    var responseStyle: String
+    var setupStatus: String
+    var currentStep: String
+    var setupMode: String
+    var createdAt: Double
+    var updatedAt: Double
+
+    var isCompleted: Bool { setupStatus == "completed" }
+}
+
+/// 个性化配置持久化。配置很小,整文件读写比增量补丁更直白;所有读写串到一条队列避免并发覆盖。
+enum RemoteBotProfileStore {
+    private struct Database: Codable { var records: [String: RemoteBotProfileRecord] = [:] }
+
+    private static let queue = DispatchQueue(label: "claudepet.remote.profile.store")
+    static var overridePathForTesting: String?
+
+    static var dataDirectory: String {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?.path
+            ?? (NSHomeDirectory() + "/Library/Application Support")
+        return base + "/com.claude.pet"
+    }
+
+    static var filePath: String { overridePathForTesting ?? (dataDirectory + "/remote-profiles.json") }
+
+    static func key(platform: String, remoteUserID: String, botID: String) -> String {
+        [platform, remoteUserID, botID].joined(separator: "|")
+    }
+
+    static func record(platform: String, remoteUserID: String, botID: String) -> RemoteBotProfileRecord? {
+        queue.sync { load().records[key(platform: platform, remoteUserID: remoteUserID, botID: botID)] }
+    }
+
+    @discardableResult
+    static func update(platform: String, remoteUserID: String, botID: String,
+                       _ mutate: (inout RemoteBotProfileRecord) -> Void) -> RemoteBotProfileRecord {
+        queue.sync {
+            var db = load()
+            let k = key(platform: platform, remoteUserID: remoteUserID, botID: botID)
+            var rec = db.records[k] ?? RemoteBotProfileRecord(platform: platform, remoteUserID: remoteUserID, botID: botID,
+                                                              botName: "", userTitle: "", responseStyle: "",
+                                                              setupStatus: "choosing_mode", currentStep: "mode",
+                                                              setupMode: "", createdAt: Date().timeIntervalSince1970,
+                                                              updatedAt: Date().timeIntervalSince1970)
+            mutate(&rec)
+            rec.updatedAt = Date().timeIntervalSince1970
+            db.records[k] = rec
+            save(db)
+            return rec
+        }
+    }
+
+    static func remove(platform: String, remoteUserID: String, botID: String) {
+        queue.sync {
+            var db = load()
+            db.records.removeValue(forKey: key(platform: platform, remoteUserID: remoteUserID, botID: botID))
+            save(db)
+        }
+    }
+
+    private static func load() -> Database {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: filePath)),
+              let db = try? JSONDecoder().decode(Database.self, from: data) else { return Database() }
+        return db
+    }
+
+    private static func save(_ db: Database) {
+        do {
+            try FileManager.default.createDirectory(atPath: (filePath as NSString).deletingLastPathComponent,
+                                                    withIntermediateDirectories: true)
+            let enc = JSONEncoder()
+            enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+            let data = try enc.encode(db)
+            try data.write(to: URL(fileURLWithPath: filePath), options: .atomic)
+        } catch {
+            PetView.log("远程个性化配置写入失败:\(error.localizedDescription)")
+        }
+    }
+}
+
+enum RemoteBotSetupResult {
+    case reply(String, resetSession: Bool)
+    case proceed(String)
+}
+
+/// 远程 Bot 初始化状态机。只返回“该回什么”或“可进入 Agent 的增强 prompt”,不碰 Telegram/飞书收发细节。
+enum RemoteBotSetup {
+    static let defaultStyle = "正常"
+
+    static func botID(for tool: FeedTool) -> String {
+        switch tool {
+        case .claude: return "claude"
+        case .codex: return "codex"
+        }
+    }
+
+    static func handle(platform: String, remoteUserID: String, botID: String, toolLabel: String,
+                       incoming rawText: String) -> RemoteBotSetupResult {
+        let text = normalized(rawText)
+        let lower = text.lowercased()
+
+        if lower == "/setup" {
+            let rec = start(platform: platform, remoteUserID: remoteUserID, botID: botID)
+            return .reply(intro(toolLabel: toolLabel, record: rec), resetSession: true)
+        }
+        if lower == "/reset" {
+            RemoteBotProfileStore.remove(platform: platform, remoteUserID: remoteUserID, botID: botID)
+            let rec = start(platform: platform, remoteUserID: remoteUserID, botID: botID)
+            return .reply("🧹 已清空当前 Bot 设置。\n\n" + intro(toolLabel: toolLabel, record: rec), resetSession: true)
+        }
+        if lower == "/profile" {
+            guard let rec = RemoteBotProfileStore.record(platform: platform, remoteUserID: remoteUserID, botID: botID),
+                  rec.isCompleted else {
+                let rec = start(platform: platform, remoteUserID: remoteUserID, botID: botID)
+                return .reply("⚙️ 当前 Bot 尚未完成设置。\n\n" + intro(toolLabel: toolLabel, record: rec), resetSession: false)
+            }
+            return .reply(profileText(rec), resetSession: false)
+        }
+
+        guard let rec = RemoteBotProfileStore.record(platform: platform, remoteUserID: remoteUserID, botID: botID) else {
+            let started = start(platform: platform, remoteUserID: remoteUserID, botID: botID)
+            if text == "1" || text == "2" {
+                return handleSetupInput(text, record: started, toolLabel: toolLabel)
+            }
+            return .reply(blockedIntro(toolLabel: toolLabel, record: started), resetSession: false)
+        }
+
+        if rec.isCompleted {
+            return .proceed(decoratePrompt(rawText, profile: rec))
+        }
+
+        if text.hasPrefix("/") {
+            return .reply("⚙️ 当前 Bot 尚未完成设置，请先完成个性化设置后再使用。\n\n" + currentPrompt(toolLabel: toolLabel, record: rec),
+                          resetSession: false)
+        }
+        return handleSetupInput(text, record: rec, toolLabel: toolLabel)
+    }
+
+    static func runSelfTest() -> Bool {
+        let oldPath = RemoteBotProfileStore.overridePathForTesting
+        let tmp = NSTemporaryDirectory() + "claudepet-remote-profile-selftest-\(UUID().uuidString).json"
+        RemoteBotProfileStore.overridePathForTesting = tmp
+        defer {
+            RemoteBotProfileStore.overridePathForTesting = oldPath
+            try? FileManager.default.removeItem(atPath: tmp)
+        }
+
+        func expectReply(_ result: RemoteBotSetupResult, contains needle: String) -> Bool {
+            if case .reply(let text, _) = result { return text.contains(needle) }
+            return false
+        }
+        func expectProceed(_ result: RemoteBotSetupResult, contains needle: String) -> Bool {
+            if case .proceed(let prompt) = result { return prompt.contains(needle) }
+            return false
+        }
+        func check(_ label: String, _ condition: Bool) -> Bool {
+            if !condition { print("  失败:\(label)") }
+            return condition
+        }
+
+        let p = "telegram", u1 = "user-a", u2 = "user-b", b = "claude"
+        var ok = true
+        ok = check("首次普通消息被拦截", expectReply(handle(platform: p, remoteUserID: u1, botID: b, toolLabel: "cc/claude", incoming: "帮我查代码"), contains: "尚未完成设置")) && ok
+        ok = check("错误数字提示", expectReply(handle(platform: p, remoteUserID: u1, botID: b, toolLabel: "cc/claude", incoming: "3"), contains: "请输入数字 1 或 2")) && ok
+        ok = check("选择逐步设置", expectReply(handle(platform: p, remoteUserID: u1, botID: b, toolLabel: "cc/claude", incoming: "1"), contains: "请给这个 Bot 起一个名字")) && ok
+        ok = check("Bot 名字不能为空", expectReply(handle(platform: p, remoteUserID: u1, botID: b, toolLabel: "cc/claude", incoming: "   "), contains: "不能为空")) && ok
+        ok = check("填写 Bot 名字", expectReply(handle(platform: p, remoteUserID: u1, botID: b, toolLabel: "cc/claude", incoming: "德全"), contains: "请设置 Bot 对您的称呼")) && ok
+        ok = check("填写称呼", expectReply(handle(platform: p, remoteUserID: u1, botID: b, toolLabel: "cc/claude", incoming: "主公"), contains: "请设置 Bot 的说话风格")) && ok
+        ok = check("填写风格后确认", expectReply(handle(platform: p, remoteUserID: u1, botID: b, toolLabel: "cc/claude", incoming: "正常"), contains: "请确认当前设置")) && ok
+        ok = check("确认保存", expectReply(handle(platform: p, remoteUserID: u1, botID: b, toolLabel: "cc/claude", incoming: "1"), contains: "设置已保存")) && ok
+        ok = check("完成后放行增强 prompt", expectProceed(handle(platform: p, remoteUserID: u1, botID: b, toolLabel: "cc/claude", incoming: "现在可以用了"), contains: "对用户称呼：主公")) && ok
+        ok = check("不同用户隔离", expectReply(handle(platform: p, remoteUserID: u2, botID: b, toolLabel: "cc/claude", incoming: "现在可以用了"), contains: "尚未完成设置")) && ok
+
+        let q = "codex"
+        ok = check("选择快速设置", expectReply(handle(platform: "feishu", remoteUserID: u1, botID: q, toolLabel: "cx/codex", incoming: "2"), contains: "请用一段话描述")) && ok
+        ok = check("快速设置缺称呼追问", expectReply(handle(platform: "feishu", remoteUserID: u1, botID: q, toolLabel: "cx/codex", incoming: "你叫小智，说话正常一点。"), contains: "怎么称呼您")) && ok
+        ok = check("补齐称呼后确认", expectReply(handle(platform: "feishu", remoteUserID: u1, botID: q, toolLabel: "cx/codex", incoming: "老板"), contains: "请确认当前设置")) && ok
+        ok = check("确认页重新设置", expectReply(handle(platform: "feishu", remoteUserID: u1, botID: q, toolLabel: "cx/codex", incoming: "2"), contains: "请选择设置方式")) && ok
+        ok = check("重新进入快速设置", expectReply(handle(platform: "feishu", remoteUserID: u1, botID: q, toolLabel: "cx/codex", incoming: "2"), contains: "请用一段话描述")) && ok
+        ok = check("快速设置完整解析", expectReply(handle(platform: "feishu", remoteUserID: u1, botID: q, toolLabel: "cx/codex", incoming: "你叫德全，称呼我为主公，说话恭敬一点，但不要太啰嗦。"), contains: "请确认当前设置")) && ok
+        ok = check("快速设置确认保存", expectReply(handle(platform: "feishu", remoteUserID: u1, botID: q, toolLabel: "cx/codex", incoming: "1"), contains: "设置已保存")) && ok
+        ok = check("查看配置", expectReply(handle(platform: "feishu", remoteUserID: u1, botID: q, toolLabel: "cx/codex", incoming: "/profile"), contains: "Bot 名字：德全")) && ok
+        ok = check("重置配置", expectReply(handle(platform: "feishu", remoteUserID: u1, botID: q, toolLabel: "cx/codex", incoming: "/reset"), contains: "已清空")) && ok
+        return ok
+    }
+
+    private static func start(platform: String, remoteUserID: String, botID: String) -> RemoteBotProfileRecord {
+        RemoteBotProfileStore.update(platform: platform, remoteUserID: remoteUserID, botID: botID) { rec in
+            rec.botName = ""
+            rec.userTitle = ""
+            rec.responseStyle = ""
+            rec.setupStatus = "choosing_mode"
+            rec.currentStep = "mode"
+            rec.setupMode = ""
+        }
+    }
+
+    private static func handleSetupInput(_ text: String, record rec: RemoteBotProfileRecord,
+                                         toolLabel: String) -> RemoteBotSetupResult {
+        switch rec.currentStep {
+        case "mode":
+            if text == "1" {
+                let next = RemoteBotProfileStore.update(platform: rec.platform, remoteUserID: rec.remoteUserID, botID: rec.botID) {
+                    $0.setupStatus = "in_progress"; $0.setupMode = "step"; $0.currentStep = "bot_name"
+                }
+                return .reply(currentPrompt(toolLabel: toolLabel, record: next), resetSession: true)
+            }
+            if text == "2" {
+                let next = RemoteBotProfileStore.update(platform: rec.platform, remoteUserID: rec.remoteUserID, botID: rec.botID) {
+                    $0.setupStatus = "in_progress"; $0.setupMode = "quick"; $0.currentStep = "quick_description"
+                }
+                return .reply(currentPrompt(toolLabel: toolLabel, record: next), resetSession: true)
+            }
+            return .reply("""
+            🔢 请输入数字 1 或 2。
+
+            1️⃣ 一步步设置
+            2️⃣ 用一段话快速设置
+            """, resetSession: false)
+
+        case "quick_description":
+            guard let extracted = extractQuickConfig(from: text) else {
+                return .reply("""
+                🤔 暂时没有识别出有效设置，请重新描述。
+
+                💡 例如：
+                “你叫德全，称呼我为主公，说话正常一点。”
+                """, resetSession: false)
+            }
+            let next = RemoteBotProfileStore.update(platform: rec.platform, remoteUserID: rec.remoteUserID, botID: rec.botID) {
+                if let name = extracted.botName { $0.botName = name }
+                if let title = extracted.userTitle { $0.userTitle = title }
+                if let style = extracted.responseStyle { $0.responseStyle = style }
+                $0.currentStep = nextMissingStep($0)
+                if $0.currentStep == "confirm" { $0.setupStatus = "confirming" }
+            }
+            return .reply(currentPrompt(toolLabel: toolLabel, record: next), resetSession: false)
+
+        case "bot_name":
+            let checked = validateField(text, name: "Bot 名字", limit: 40)
+            guard let value = checked.value else {
+                return .reply(checked.message, resetSession: false)
+            }
+            let next = RemoteBotProfileStore.update(platform: rec.platform, remoteUserID: rec.remoteUserID, botID: rec.botID) {
+                $0.botName = value; $0.currentStep = nextMissingStep($0)
+                if $0.currentStep == "confirm" { $0.setupStatus = "confirming" }
+            }
+            return .reply(currentPrompt(toolLabel: toolLabel, record: next), resetSession: false)
+
+        case "user_title":
+            let checked = validateField(text, name: "称呼", limit: 40)
+            guard let value = checked.value else {
+                return .reply(checked.message, resetSession: false)
+            }
+            let next = RemoteBotProfileStore.update(platform: rec.platform, remoteUserID: rec.remoteUserID, botID: rec.botID) {
+                $0.userTitle = value; $0.currentStep = nextMissingStep($0)
+                if $0.currentStep == "confirm" { $0.setupStatus = "confirming" }
+            }
+            return .reply(currentPrompt(toolLabel: toolLabel, record: next), resetSession: false)
+
+        case "response_style":
+            let checked = validateField(text, name: "说话风格", limit: 120)
+            guard let value = checked.value else {
+                return .reply(checked.message, resetSession: false)
+            }
+            let next = RemoteBotProfileStore.update(platform: rec.platform, remoteUserID: rec.remoteUserID, botID: rec.botID) {
+                $0.responseStyle = value; $0.currentStep = "confirm"; $0.setupStatus = "confirming"
+            }
+            return .reply(currentPrompt(toolLabel: toolLabel, record: next), resetSession: false)
+
+        case "confirm":
+            if text == "1" {
+                let next = RemoteBotProfileStore.update(platform: rec.platform, remoteUserID: rec.remoteUserID, botID: rec.botID) {
+                    $0.setupStatus = "completed"; $0.currentStep = ""; $0.setupMode = ""
+                }
+                return .reply("✅ 设置已保存。\n\n" + profileText(next), resetSession: true)
+            }
+            if text == "2" {
+                let next = start(platform: rec.platform, remoteUserID: rec.remoteUserID, botID: rec.botID)
+                return .reply(intro(toolLabel: toolLabel, record: next), resetSession: true)
+            }
+            return .reply("""
+            🔢 请输入数字：
+
+            1️⃣ 确认保存
+            2️⃣ 重新设置
+            """, resetSession: false)
+
+        default:
+            let next = start(platform: rec.platform, remoteUserID: rec.remoteUserID, botID: rec.botID)
+            return .reply(intro(toolLabel: toolLabel, record: next), resetSession: true)
+        }
+    }
+
+    private static func intro(toolLabel: String, record: RemoteBotProfileRecord) -> String {
+        """
+        ✨ 欢迎使用这个 \(toolLabel) Bot
+
+        使用前需要先完成个性化设置，让我知道怎么称呼您、我叫什么、说话应该是什么风格。
+
+        🧭 请选择设置方式：
+        1️⃣ 一步步设置
+        2️⃣ 用一段话快速设置
+
+        💡 如果选择 2，可以直接这样说：
+        “你叫德全，称呼我为主公，说话恭敬一点，但不要太啰嗦。”
+        """
+    }
+
+    private static func blockedIntro(toolLabel: String, record: RemoteBotProfileRecord) -> String {
+        "⚙️ 当前 Bot 尚未完成设置，请先完成个性化设置后再使用。\n\n" + intro(toolLabel: toolLabel, record: record)
+    }
+
+    private static func currentPrompt(toolLabel: String, record rec: RemoteBotProfileRecord) -> String {
+        switch rec.currentStep {
+        case "mode":
+            return intro(toolLabel: toolLabel, record: rec)
+        case "quick_description":
+            return """
+            📝 请用一段话描述您希望如何设置这个 Bot。
+
+            💡 例如：
+            “你叫德全，称呼我为主公，说话恭敬一点，但不要太啰嗦。”
+            """
+        case "bot_name":
+            if rec.setupMode == "quick" { return "🏷️ 还差一个设置：请给这个 Bot 起一个名字。" }
+            return "🏷️ 请给这个 Bot 起一个名字。"
+        case "user_title":
+            if rec.setupMode == "quick" { return "🙋 还差一个设置：请问 Bot 应该怎么称呼您？" }
+            return """
+            🙋 请设置 Bot 对您的称呼。
+
+            💡 例如：老板、主人、主公、张总、小李。
+            """
+        case "response_style":
+            if rec.setupMode == "quick" { return "🎭 还差一个设置：请设置 Bot 的说话风格。" }
+            return """
+            🎭 请设置 Bot 的说话风格。
+
+            💡 例如：正常、简洁专业、温柔耐心、古风恭敬。
+            """
+        case "confirm":
+            return """
+            ✅ 请确认当前设置：
+
+            🏷️ Bot 名字：\(rec.botName)
+            🙋 对您的称呼：\(rec.userTitle)
+            🎭 说话风格：\(rec.responseStyle.isEmpty ? defaultStyle : rec.responseStyle)
+
+            回复：
+            1️⃣ 确认保存
+            2️⃣ 重新设置
+            """
+        default:
+            return intro(toolLabel: toolLabel, record: rec)
+        }
+    }
+
+    private static func profileText(_ rec: RemoteBotProfileRecord) -> String {
+        """
+        📋 当前 Bot 设置：
+
+        🏷️ Bot 名字：\(rec.botName)
+        🙋 对您的称呼：\(rec.userTitle)
+        🎭 说话风格：\(rec.responseStyle.isEmpty ? defaultStyle : rec.responseStyle)
+        """
+    }
+
+    private static func decoratePrompt(_ prompt: String, profile rec: RemoteBotProfileRecord) -> String {
+        """
+        请按以下个性化设置回复当前远程用户：
+        - 你的名字：\(rec.botName)
+        - 对用户称呼：\(rec.userTitle)
+        - 说话风格：\(rec.responseStyle.isEmpty ? defaultStyle : rec.responseStyle)
+
+        用户消息：
+        \(prompt)
+        """
+    }
+
+    private static func nextMissingStep(_ rec: RemoteBotProfileRecord) -> String {
+        if rec.botName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "bot_name" }
+        if rec.userTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "user_title" }
+        if rec.responseStyle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "response_style" }
+        return "confirm"
+    }
+
+    private static func validateField(_ text: String, name: String, limit: Int) -> (value: String?, message: String) {
+        let value = normalized(text)
+        guard !value.isEmpty else { return (nil, "⚠️ \(name)不能为空，请重新输入。") }
+        if value.count > limit { return (nil, "⚠️ \(name)内容过长，请重说。") }
+        if value.hasPrefix("/") { return (nil, "⚠️ \(name)不符合项目规则，请重说。") }
+        return (value, "")
+    }
+
+    private static func normalized(_ text: String) -> String {
+        text.trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(whereSeparator: { $0.isWhitespace || $0.isNewline })
+            .joined(separator: " ")
+    }
+
+    private struct QuickConfig {
+        var botName: String?
+        var userTitle: String?
+        var responseStyle: String?
+    }
+
+    private static func extractQuickConfig(from text: String) -> QuickConfig? {
+        let raw = normalized(text)
+        guard !raw.isEmpty, raw.count <= 500 else { return nil }
+        var result = QuickConfig()
+        result.botName = firstMatch(in: raw, patterns: ["你叫", "名字叫", "以后叫"])
+        result.userTitle = firstMatch(in: raw, patterns: ["称呼我为", "叫我", "喊我", "称呼我", "对我称呼为"])
+        if let style = firstMatch(in: raw, patterns: ["说话", "风格", "语气"]) {
+            result.responseStyle = style
+        } else if raw.contains("正常") {
+            result.responseStyle = defaultStyle
+        }
+        let hasAny = result.botName != nil || result.userTitle != nil || result.responseStyle != nil
+        return hasAny ? result : nil
+    }
+
+    private static func firstMatch(in text: String, patterns: [String]) -> String? {
+        for p in patterns {
+            guard let range = text.range(of: p) else { continue }
+            var tail = String(text[range.upperBound...])
+            tail = tail.trimmingCharacters(in: .whitespacesAndNewlines)
+            if tail.hasPrefix("：") || tail.hasPrefix(":") { tail.removeFirst() }
+            let separators = CharacterSet(charactersIn: "，,。.;；\n")
+            let head = tail.components(separatedBy: separators).first ?? tail
+            let cleaned = normalized(head)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "“”\"' "))
+            if !cleaned.isEmpty, cleaned.count <= 120 { return cleaned }
+        }
+        return nil
+    }
+}
+
 /// 一个 Telegram bot 的轮询器:long polling 收消息 → 解析指令/喂 agent → 回话。
 /// 每个实例绑定一个 token + 一个 tool(cc 或 cx);按 chat id 各建一份 ChatContext,
 /// 不同用户并行、各记各的目录与上下文,同一用户串行,所以谁也不串话、谁也卡不住谁。
@@ -391,7 +839,7 @@ final class TelegramBot {
     /// 桌宠联动回调:phase ∈ "start"(收到消息开干) / "done"(干完);summary 给横幅。主线程里调。
     private let onActivity: (FeedTool, String, String?) -> Void
 
-    /// 按 chat id 索引的会话态。只在轮询线程(loop→handle)里查/建,故无需为字典本身加锁。
+    /// 按远程发送者索引的会话态。私聊时发送者 id 通常等于 chat id;群里按发送者拆开,避免多人共享上下文。
     private var contexts: [String: ChatContext] = [:]
     private var offset = 0
     private var running = false
@@ -410,13 +858,13 @@ final class TelegramBot {
         self.urlSession = URLSession(configuration: cfg)
     }
 
-    /// 取该 chat 的会话态,没有就按默认目录新建。仅轮询线程调用,无需加锁。
-    private func context(for chatID: String) -> ChatContext {
-        if let ctx = contexts[chatID] { return ctx }
+    /// 取该远程用户的会话态,没有就按默认目录新建。仅轮询线程调用,无需加锁。
+    private func context(for remoteUserID: String) -> ChatContext {
+        if let ctx = contexts[remoteUserID] { return ctx }
         let tag = tool == .codex ? "cx" : "cc"
-        let ctx = ChatContext(tool: tool, cwd: home, label: "claudepet.remote.\(tag).\(chatID)")
-        contexts[chatID] = ctx
-        PetView.log("Telegram[\(tool.label)] 新建会话 chat \(chatID),默认目录 \(home)")
+        let ctx = ChatContext(tool: tool, cwd: home, label: "claudepet.remote.\(tag).\(remoteUserID)")
+        contexts[remoteUserID] = ctx
+        PetView.log("Telegram[\(tool.label)] 新建会话 user \(remoteUserID),默认目录 \(home)")
         return ctx
     }
 
@@ -467,6 +915,7 @@ final class TelegramBot {
         let chatID = String(describing: chat["id"] ?? "")
         // 发起人可读名:优先 @username,退而 first_name + last_name,再退 chat id。供任务监控展示"具体谁发起的"。
         let senderName = TelegramBot.senderDisplayName(from: message["from"] as? [String: Any], chatID: chatID)
+        let remoteUserID = TelegramBot.senderID(from: message["from"] as? [String: Any], fallback: chatID)
 
         // 白名单:非空时只认名单内 chat;空名单放行但记日志提醒主公尽快设白名单。
         if !allowedChatIDs.isEmpty, !allowedChatIDs.contains(chatID) {
@@ -478,14 +927,29 @@ final class TelegramBot {
             PetView.log("Telegram[\(tool.label)] 警告:未设白名单,chat \(chatID) 已放行")
         }
 
-        let ctx = context(for: chatID)
-        if text.hasPrefix("/") { handleCommand(text, ctx: ctx, chatID: chatID); return }
-        // 占用失败=该用户上一条还在跑:立即回提示,绝不排队(否则轮询线程也会被拖住)。
-        guard ctx.tryBegin() else {
-            sendMessage(chatID: chatID, text: "上一条还在跑,等它答完再发哈。")
+        let ctx = context(for: remoteUserID)
+        switch RemoteBotSetup.handle(platform: "telegram", remoteUserID: remoteUserID,
+                                     botID: RemoteBotSetup.botID(for: tool), toolLabel: tool.label,
+                                     incoming: text) {
+        case .reply(let reply, let resetSession):
+            if resetSession { ctx.setSessionID(nil) }
+            sendMessage(chatID: chatID, text: reply)
             return
+        case .proceed(let personalizedPrompt):
+            if text.hasPrefix("/") { handleCommand(text, ctx: ctx, chatID: chatID); return }
+            guard ctx.tryBegin() else {
+                sendMessage(chatID: chatID, text: "上一条还在跑,等它答完再发哈。")
+                return
+            }
+            runAgent(prompt: personalizedPrompt, originalPrompt: text, ctx: ctx, chatID: chatID,
+                     remoteUserID: remoteUserID, senderName: senderName)
         }
-        runAgent(prompt: text, ctx: ctx, chatID: chatID, senderName: senderName)
+    }
+
+    /// Telegram 的真实发送者 id。群聊里 chat id 是群,必须用 from.id 才能按人隔离。
+    static func senderID(from raw: [String: Any]?, fallback: String) -> String {
+        guard let from = raw, let id = from["id"] else { return fallback }
+        return String(describing: id)
     }
 
     /// 从 Telegram message.from 拼一个可读发起人名:@username 优先,再 first_name [last_name],兜底 chat id。
@@ -525,6 +989,9 @@ final class TelegramBot {
             /cd <路径>  切换工作目录(并开新会话)
             /pwd        看当前目录
             /new        开新会话(清上下文)
+            /setup      重新设置当前 Bot
+            /profile    查看当前 Bot 设置
+            /reset      清空当前 Bot 设置并重新引导
             /help       这条帮助
             当前目录:\(ctx.cwd)
             """)
@@ -536,12 +1003,13 @@ final class TelegramBot {
     /// 把消息当 prompt 喂给 agent:派到该 chat 的串行队列后台跑,轮询线程立刻返回继续收别人的消息。
     /// 流程:桌宠开跑 → 先占一条进度消息 → 边跑边把 cc/cx 的步骤原地编辑进这条消息 → 写回会话 id、解忙 → 收尾进度 + 另发最终正文 → 桌宠收工。
     /// 调用前 handle 已 tryBegin() 占用。进度回调在 AgentRunner 的读取线程里触发,经 ProgressPanel 节流后才真正发编辑请求,避免触发 Telegram 限流。
-    private func runAgent(prompt: String, ctx: ChatContext, chatID: String, senderName: String) {
+    private func runAgent(prompt: String, originalPrompt: String, ctx: ChatContext, chatID: String,
+                          remoteUserID: String, senderName: String) {
         let tool = self.tool
         ctx.queue.async { [weak self] in
             guard let self = self else { return }
             DispatchQueue.main.async { self.onActivity(tool, "start", nil) }
-            PetView.log("Telegram[\(tool.label)] chat \(chatID) 收到 \(prompt.count) 字,开跑")
+            PetView.log("Telegram[\(tool.label)] user \(remoteUserID) 收到 \(originalPrompt.count) 字,开跑")
             let startedAt = Date()   // 墙钟计时起点:供任务监控算"运行了多长时间"
 
             // 先占一条进度消息,随后原地编辑刷新;拿不到 message_id 则退化为只在跑完发结果。
@@ -560,8 +1028,8 @@ final class TelegramBot {
 
             // 任务监控:落盘本轮"问题→答案"连同发起人、耗时、花费(开关关闭时 record 内部直接跳过)。
             DispatchQueue.main.async {
-                TaskMonitor.record(source: "telegram", tool: tool, initiatorID: chatID, initiatorName: senderName,
-                                   cwd: snap.cwd, question: prompt, answer: reply.text,
+                TaskMonitor.record(source: "telegram", tool: tool, initiatorID: remoteUserID, initiatorName: senderName,
+                                   cwd: snap.cwd, question: originalPrompt, answer: reply.text,
                                    startedAt: startedAt, endedAt: Date(), status: reply.status,
                                    sessionID: reply.sessionID, metrics: reply.metrics)
             }
@@ -691,6 +1159,7 @@ final class RemoteControl {
         feishuBots.forEach { $0.start() }
 
         PetView.log("远程遥控重载:Telegram \(bots.count) 个 bot,飞书 \(feishuBots.count) 个 bot")
+        RemoteFeatureAnnouncement.pushIfNeeded()
     }
 
     private func makeBot(token: String, tool: FeedTool, home: String, allow: Set<String>) -> TelegramBot {
@@ -703,6 +1172,194 @@ final class RemoteControl {
         return FeishuBot(appID: appID, appSecret: appSecret, tool: tool, home: home, allowedOpenIDs: allow) { [weak self] tool, phase, summary in
             self?.onActivity?(tool, phase, summary)
         }
+    }
+}
+
+/// 远程功能公告:每台电脑、每个 Telegram bot、每个白名单 chat 对同一公告版本只推送一次。
+/// 只向白名单推送;白名单为空时跳过,避免新机器初次配置时误发到未知会话。
+enum RemoteFeatureAnnouncement {
+    static let version = "remoteBotPersonalizedSetup.v1"
+
+    static let message = """
+    ✨ ClaudePet 远程 Bot 个性化设置上线啦
+
+    各位主公请注意：
+    从现在开始，远程 Bot 不再是一个冷冰冰的打工机器了。
+    它可以有名字、有称呼、有脾气，甚至可以稍微有点人设。
+
+    🧭 第一次使用先做个小设置
+
+    首次使用 Bot 时，会先请您完成一次个性化设置。
+    设置没完成前，普通问题会先被拦住，Bot 会乖乖提醒您先设置，不会直接开工乱跑。
+
+    您可以选择：
+
+    1️⃣ 一步步设置
+    适合慢慢调教。
+
+    会依次问您：
+
+    🏷️ Bot 叫什么名字
+    比如：德全、小智、阿福、代码管家
+
+    🙋 Bot 怎么称呼您
+    比如：老板、主公、主人、张总、小李
+
+    🎭 Bot 用什么说话风格
+    比如：正常、简洁专业、温柔耐心、古风恭敬
+
+    2️⃣ 一句话快速设置
+    适合懒得一步步答的主公。
+
+    直接这样说就行：
+    “你叫德全，称呼我为主公，说话恭敬一点，但不要太啰嗦。”
+
+    Bot 会自己努力理解。
+    理解不全的地方，它会再追问您，不会装懂。
+
+    🔒 每个人都有自己的 Bot 设置
+
+    不用担心串味。
+    同一个 Bot，在不同用户那里可以是不同名字、不同称呼、不同风格。
+    您的 Bot 是您的，别人的 Bot 是别人的，互不影响。
+
+    🛠️ 常用命令
+
+    /setup
+    重新设置当前 Bot
+
+    /profile
+    查看当前 Bot 的设置
+
+    /reset
+    清空当前设置，然后重新开始
+
+    /help
+    查看帮助
+
+    💡 小提示
+
+    如果您之前已经用过这个 Bot，想体验新设置流程，可以直接发送：
+    /setup
+
+    或者想从头来过，就发送：
+    /reset
+
+    好了，调教开始。
+    请给您的 Bot 一个响亮的名字吧。
+    """
+
+    struct Target {
+        let platform: String
+        let toolID: String
+        let credentialA: String
+        let credentialB: String
+        let recipientID: String
+    }
+
+    static func pendingTargets() -> [Target] {
+        guard Settings.remoteEnabled else { return [] }
+        return pendingTelegramTargets() + pendingFeishuTargets()
+    }
+
+    static func pendingTelegramTargets() -> [Target] {
+        let chats = Settings.telegramAllowedChatIDSet.sorted()
+        guard !chats.isEmpty else { return [] }
+        let bots: [(String, String)] = [
+            ("claude", Settings.telegramClaudeToken),
+            ("codex", Settings.telegramCodexToken),
+        ].filter { !$0.1.isEmpty }
+        return bots.flatMap { bot in
+            chats.compactMap { chat in
+                wasSent(platform: "telegram", toolID: bot.0, recipientID: chat)
+                    ? nil
+                    : Target(platform: "telegram", toolID: bot.0, credentialA: bot.1, credentialB: "", recipientID: chat)
+            }
+        }
+    }
+
+    static func pendingFeishuTargets() -> [Target] {
+        let openIDs = Settings.feishuAllowedOpenIDSet.sorted()
+        guard !openIDs.isEmpty else { return [] }
+        let bots: [(String, String, String)] = [
+            ("claude", Settings.feishuClaudeAppID, Settings.feishuClaudeAppSecret),
+            ("codex", Settings.feishuCodexAppID, Settings.feishuCodexAppSecret),
+        ].filter { !$0.1.isEmpty && !$0.2.isEmpty }
+        return bots.flatMap { bot in
+            openIDs.compactMap { openID in
+                wasSent(platform: "feishu", toolID: bot.0, recipientID: openID)
+                    ? nil
+                    : Target(platform: "feishu", toolID: bot.0, credentialA: bot.1, credentialB: bot.2, recipientID: openID)
+            }
+        }
+    }
+
+    static func pushIfNeeded() {
+        let targets = pendingTargets()
+        guard !targets.isEmpty else {
+            if Settings.remoteEnabled, Settings.telegramAllowedChatIDSet.isEmpty {
+                PetView.log("远程公告:未配置 Telegram 白名单,跳过自动推送")
+            }
+            if Settings.remoteEnabled, Settings.feishuAllowedOpenIDSet.isEmpty {
+                PetView.log("远程公告:未配置飞书 open_id 白名单,跳过自动推送")
+            }
+            return
+        }
+        DispatchQueue.global().async {
+            var sent = 0
+            for target in targets {
+                let ok: Bool
+                switch target.platform {
+                case "telegram":
+                    ok = sendTelegram(token: target.credentialA, chatID: target.recipientID, text: message)
+                case "feishu":
+                    ok = sendFeishu(appID: target.credentialA, appSecret: target.credentialB, openID: target.recipientID, text: message)
+                default:
+                    ok = false
+                }
+                if ok {
+                    markSent(platform: target.platform, toolID: target.toolID, recipientID: target.recipientID)
+                    sent += 1
+                }
+            }
+            PetView.log("远程公告:\(version) 自动推送完成,成功 \(sent)/\(targets.count) 条")
+        }
+    }
+
+    private static func key(platform: String, toolID: String, recipientID: String) -> String {
+        "remoteAnnouncement.\(version).\(platform).\(toolID).\(recipientID)"
+    }
+
+    private static func wasSent(platform: String, toolID: String, recipientID: String) -> Bool {
+        UserDefaults.standard.bool(forKey: key(platform: platform, toolID: toolID, recipientID: recipientID))
+    }
+
+    private static func markSent(platform: String, toolID: String, recipientID: String) {
+        UserDefaults.standard.set(true, forKey: key(platform: platform, toolID: toolID, recipientID: recipientID))
+    }
+
+    private static func sendTelegram(token: String, chatID: String, text: String) -> Bool {
+        var ok = false
+        let sem = DispatchSemaphore(value: 0)
+        guard let url = URL(string: "https://api.telegram.org/bot\(token)/sendMessage") else { return false }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["chat_id": chatID, "text": text])
+        URLSession.shared.dataTask(with: req) { data, _, error in
+            defer { sem.signal() }
+            guard error == nil,
+                  let data = data,
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  (obj["ok"] as? Bool) == true else { return }
+            ok = true
+        }.resume()
+        _ = sem.wait(timeout: .now() + 20)
+        return ok
+    }
+
+    private static func sendFeishu(appID: String, appSecret: String, openID: String, text: String) -> Bool {
+        FeishuAPI(appID: appID, appSecret: appSecret).sendText(receiveID: openID, receiveIDType: "open_id", text: text) != nil
     }
 }
 
