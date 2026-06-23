@@ -361,6 +361,7 @@ final class ProgressPanel {
 
     /// 追加一行进度;超过窗口上限就丢最旧的,只留尾部。
     func append(_ line: String) {
+        guard lines.last != line else { return }
         lines.append(line)
         if lines.count > maxLines { lines.removeFirst(); omitted += 1 }
     }
@@ -837,12 +838,316 @@ enum RemoteBotSetup {
     }
 }
 
+/// Telegram 文件落地后的任务目录。每条文件消息新建一份任务,只把当前任务 outbox 里的普通文件自动回传。
+struct RemoteFileTask {
+    struct InputFile {
+        let sourceKind: String
+        let fileID: String
+        let originalName: String
+        let storedName: String
+        let path: String
+        let size: Int?
+        let mimeType: String?
+    }
+
+    let platform: String
+    let botID: String
+    let remoteUserID: String
+    let taskID: String
+    let createdAt: Date
+    let root: URL
+    let inbox: URL
+    let work: URL
+    let outbox: URL
+    let meta: URL
+
+    static func create(platform: String, botID: String, remoteUserID: String, now: Date = Date(),
+                       baseDirectory: URL? = nil) throws -> RemoteFileTask {
+        let safePlatform = sanitizePathSegment(platform, fallback: "platform")
+        let safeBot = sanitizePathSegment(botID, fallback: "bot")
+        let safeUser = sanitizePathSegment(remoteUserID, fallback: "user")
+        let cal = Calendar(identifier: .gregorian)
+        let parts = cal.dateComponents([.year, .month, .day], from: now)
+        let yyyy = String(format: "%04d", parts.year ?? 1970)
+        let mm = String(format: "%02d", parts.month ?? 1)
+        let dd = String(format: "%02d", parts.day ?? 1)
+        let taskID = makeTaskID(date: now)
+        let base = baseDirectory ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("ClaudePetRemoteFiles", isDirectory: true)
+        let root = base
+            .appendingPathComponent(safePlatform, isDirectory: true)
+            .appendingPathComponent(safeBot, isDirectory: true)
+            .appendingPathComponent(safeUser, isDirectory: true)
+            .appendingPathComponent(yyyy, isDirectory: true)
+            .appendingPathComponent(mm, isDirectory: true)
+            .appendingPathComponent(dd, isDirectory: true)
+            .appendingPathComponent(taskID, isDirectory: true)
+        let inbox = root.appendingPathComponent("inbox", isDirectory: true)
+        let work = root.appendingPathComponent("work", isDirectory: true)
+        let outbox = root.appendingPathComponent("outbox", isDirectory: true)
+        for dir in [inbox, work, outbox] {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        return RemoteFileTask(platform: safePlatform, botID: safeBot, remoteUserID: safeUser,
+                              taskID: taskID, createdAt: now, root: root, inbox: inbox,
+                              work: work, outbox: outbox, meta: root.appendingPathComponent("meta.json"))
+    }
+
+    static func load(root: URL, platform: String, botID: String, remoteUserID: String) -> RemoteFileTask? {
+        let meta = root.appendingPathComponent("meta.json", isDirectory: false)
+        let inbox = root.appendingPathComponent("inbox", isDirectory: true)
+        let work = root.appendingPathComponent("work", isDirectory: true)
+        let outbox = root.appendingPathComponent("outbox", isDirectory: true)
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: root.path, isDirectory: &isDir), isDir.boolValue,
+              FileManager.default.fileExists(atPath: meta.path),
+              FileManager.default.fileExists(atPath: inbox.path, isDirectory: &isDir), isDir.boolValue,
+              FileManager.default.fileExists(atPath: work.path, isDirectory: &isDir), isDir.boolValue,
+              FileManager.default.fileExists(atPath: outbox.path, isDirectory: &isDir), isDir.boolValue else { return nil }
+        let createdAt = ((try? meta.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate) ?? Date.distantPast
+        return RemoteFileTask(platform: sanitizePathSegment(platform, fallback: "platform"),
+                              botID: sanitizePathSegment(botID, fallback: "bot"),
+                              remoteUserID: sanitizePathSegment(remoteUserID, fallback: "user"),
+                              taskID: root.lastPathComponent, createdAt: createdAt, root: root,
+                              inbox: inbox, work: work, outbox: outbox, meta: meta)
+    }
+
+    static func latestExisting(platform: String, botID: String, remoteUserID: String,
+                               baseDirectory: URL? = nil) -> RemoteFileTask? {
+        let safePlatform = sanitizePathSegment(platform, fallback: "platform")
+        let safeBot = sanitizePathSegment(botID, fallback: "bot")
+        let safeUser = sanitizePathSegment(remoteUserID, fallback: "user")
+        let base = baseDirectory ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("ClaudePetRemoteFiles", isDirectory: true)
+        let userRoot = base
+            .appendingPathComponent(safePlatform, isDirectory: true)
+            .appendingPathComponent(safeBot, isDirectory: true)
+            .appendingPathComponent(safeUser, isDirectory: true)
+        guard let enumerator = FileManager.default.enumerator(at: userRoot, includingPropertiesForKeys: nil) else { return nil }
+        var roots: [URL] = []
+        for case let url as URL in enumerator where url.lastPathComponent == "meta.json" {
+            roots.append(url.deletingLastPathComponent())
+        }
+        guard let latestRoot = roots.max(by: { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }) else {
+            return nil
+        }
+        return load(root: latestRoot, platform: safePlatform, botID: safeBot, remoteUserID: safeUser)
+    }
+
+    static func sanitizePathSegment(_ raw: String, fallback: String) -> String {
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+        let cleaned = raw.unicodeScalars.map { allowed.contains($0) ? Character($0) : "_" }
+        let value = String(cleaned).trimmingCharacters(in: CharacterSet(charactersIn: "._-"))
+        return value.isEmpty ? fallback : String(value.prefix(80))
+    }
+
+    static func sanitizeFileName(_ raw: String, fallback: String) -> String {
+        let last = URL(fileURLWithPath: raw).lastPathComponent
+        var cleaned = last.replacingOccurrences(of: "\u{0}", with: "_")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "\\", with: "_")
+            .replacingOccurrences(of: ":", with: "_")
+            .replacingOccurrences(of: "..", with: "_")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        while cleaned.hasPrefix(".") { cleaned.removeFirst() }
+        if cleaned.isEmpty { cleaned = fallback }
+        return String(cleaned.prefix(160))
+    }
+
+    func reserveInboxURL(fileName: String) -> URL {
+        let safe = Self.sanitizeFileName(fileName, fallback: "telegram-file")
+        var candidate = inbox.appendingPathComponent(safe, isDirectory: false)
+        guard FileManager.default.fileExists(atPath: candidate.path) else { return candidate }
+        let base = (safe as NSString).deletingPathExtension
+        let ext = (safe as NSString).pathExtension
+        for idx in 2...999 {
+            let name = ext.isEmpty ? "\(base)-\(idx)" : "\(base)-\(idx).\(ext)"
+            candidate = inbox.appendingPathComponent(name, isDirectory: false)
+            if !FileManager.default.fileExists(atPath: candidate.path) { return candidate }
+        }
+        return inbox.appendingPathComponent(UUID().uuidString + "-" + safe, isDirectory: false)
+    }
+
+    func writeMeta(chatID: String, senderName: String, toolLabel: String, requestText: String,
+                   files: [InputFile]) throws {
+        let iso = ISO8601DateFormatter()
+        let filePayload: [[String: Any]] = files.map { f in
+            var item: [String: Any] = [
+                "sourceKind": f.sourceKind,
+                "fileID": f.fileID,
+                "originalName": f.originalName,
+                "storedName": f.storedName,
+                "path": f.path,
+            ]
+            if let size = f.size { item["size"] = size }
+            if let mimeType = f.mimeType { item["mimeType"] = mimeType }
+            return item
+        }
+        let payload: [String: Any] = [
+            "platform": platform,
+            "botID": botID,
+            "remoteUserID": remoteUserID,
+            "chatID": chatID,
+            "senderName": senderName,
+            "tool": toolLabel,
+            "taskID": taskID,
+            "createdAt": iso.string(from: createdAt),
+            "root": root.path,
+            "inbox": inbox.path,
+            "work": work.path,
+            "outbox": outbox.path,
+            "requestText": requestText,
+            "files": filePayload,
+        ]
+        let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+        try data.write(to: meta, options: .atomic)
+    }
+
+    func prompt(userRequest: String, files: [InputFile]) -> String {
+        let listed = files.map { "- \($0.storedName)（\($0.sourceKind)，内部路径：\($0.path)）" }.joined(separator: "\n")
+        let request = userRequest.trimmingCharacters(in: .whitespacesAndNewlines)
+        let finalRequest = request.isEmpty ? "用户只上传了文件,没有附加处理要求。请先检查文件并回复你已收到哪些文件,再请用户补充要怎么处理。没有明确要求时不要改写原始文件。" : request
+        return """
+        本次 Telegram 文件任务目录：
+        \(root.path)
+
+        收到的原始文件只能读取这里：
+        \(inbox.path)
+
+        处理中间文件请放这里：
+        \(work.path)
+
+        需要回传给 Telegram 的最终文件必须放这里：
+        \(outbox.path)
+
+        只允许把需要发回用户的最终文件放入 outbox。不要把 inbox 原始文件直接挪走；如需修改,请复制到 work 或 outbox 后再处理。
+
+        回复用户时必须简洁。不要展示任务目录、内部路径、命令过程、调试细节或大段处理步骤；只说明处理结果、是否已生成/回传文件、必要的下一步或错误原因。
+
+        本次收到的文件：
+        \(listed.isEmpty ? "（无）" : listed)
+
+        用户要求：
+        \(finalRequest)
+        """
+    }
+
+    func followUpPrompt(userRequest: String) -> String {
+        let outputs = outboxFiles().map { "- \($0.lastPathComponent)（内部路径：\($0.path)）" }.joined(separator: "\n")
+        return """
+        这是 Telegram 文件任务的后续修改。用户没有重新上传文件,请继续使用上一轮任务目录里的文件。
+
+        任务目录：
+        \(root.path)
+
+        原始文件在：
+        \(inbox.path)
+
+        上一轮处理结果在：
+        \(outbox.path)
+
+        中间文件在：
+        \(work.path)
+
+        如果 outbox 里已有上一轮结果,优先基于上一轮结果继续修改；否则基于 inbox 原始文件处理。新的最终结果仍必须放入 outbox。
+        如果用户只是询问是否处理完成、结果在哪里、有没有生成,请检查 outbox 是否已有结果文件并简短回答；不要要求用户重新上传。
+
+        当前 outbox 文件：
+        \(outputs.isEmpty ? "（暂无）" : outputs)
+
+        回复用户时必须简洁。不要展示任务目录、内部路径、命令过程、调试细节或大段处理步骤；只说明处理结果、是否已生成/回传文件、必要的下一步或错误原因。
+
+        用户这次的新要求：
+        \(userRequest)
+        """
+    }
+
+    func outboxFiles() -> [URL] {
+        guard let urls = try? FileManager.default.contentsOfDirectory(at: outbox, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles]) else {
+            return []
+        }
+        return urls.filter { url in
+            let values = try? url.resourceValues(forKeys: [.isRegularFileKey])
+            return values?.isRegularFile == true
+        }.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+    }
+
+    static func runSelfTest() -> Bool {
+        let base = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("claudepet-file-task-dryrun-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        do {
+            let fixed = Date(timeIntervalSince1970: 1_782_066_615)
+            let task = try create(platform: "telegram", botID: "cx-bot2", remoteUserID: "8231781034", now: fixed, baseDirectory: base)
+            let unsafe = "../.secret/report:1.txt"
+            let dest = task.reserveInboxURL(fileName: unsafe)
+            try Data("inbox".utf8).write(to: dest)
+            let input = InputFile(sourceKind: "document", fileID: "FILE-ID", originalName: unsafe,
+                                  storedName: dest.lastPathComponent, path: dest.path, size: 5, mimeType: "text/plain")
+            try task.writeMeta(chatID: "8231781034", senderName: "主公", toolLabel: "cx/codex", requestText: "处理这个文件", files: [input])
+            try Data("out".utf8).write(to: task.outbox.appendingPathComponent("result.txt"))
+            try FileManager.default.createDirectory(at: task.outbox.appendingPathComponent("nested", isDirectory: true),
+                                                    withIntermediateDirectories: true)
+            let newer = try create(platform: "telegram", botID: "cx-bot2", remoteUserID: "8231781034",
+                                   now: fixed.addingTimeInterval(60), baseDirectory: base)
+            try Data("new".utf8).write(to: newer.inbox.appendingPathComponent("new.txt"))
+            try newer.writeMeta(chatID: "8231781034", senderName: "主公", toolLabel: "cx/codex", requestText: "新文件", files: [])
+            let metaText = try String(contentsOf: task.meta, encoding: .utf8)
+            let outbox = task.outboxFiles().map(\.lastPathComponent)
+            let followUp = task.followUpPrompt(userRequest: "把刚才那个文件再整理一下")
+            let latest = latestExisting(platform: "telegram", botID: "cx-bot2", remoteUserID: "8231781034", baseDirectory: base)
+            let ok = task.root.path.contains("/telegram/cx-bot2/8231781034/")
+                && task.inbox.lastPathComponent == "inbox"
+                && task.work.lastPathComponent == "work"
+                && task.outbox.lastPathComponent == "outbox"
+                && !dest.lastPathComponent.contains("..")
+                && !dest.lastPathComponent.hasPrefix(".")
+                && metaText.contains("\"taskID\"")
+                && outbox == ["result.txt"]
+                && followUp.contains("后续修改")
+                && followUp.contains("result.txt")
+                && latest?.taskID == newer.taskID
+            print("Telegram 文件任务 dryrun:")
+            print("  taskRoot=\(task.root.path)")
+            print("  inboxFile=\(dest.lastPathComponent)")
+            print("  outboxFiles=\(outbox.joined(separator: ", "))")
+            print("  meta=\(task.meta.path)")
+            print("  结果:\(ok ? "PASS" : "FAIL")")
+            return ok
+        } catch {
+            print("Telegram 文件任务 dryrun:FAIL \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    private static func makeTaskID(date: Date) -> String {
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "en_US_POSIX")
+        df.dateFormat = "yyyyMMdd-HHmmss"
+        return df.string(from: date) + "-" + String(UUID().uuidString.prefix(4)).lowercased()
+    }
+}
+
 /// 一个 Telegram bot 的轮询器:long polling 收消息 → 解析指令/喂 agent → 回话。
 /// 每个实例绑定一个 token + 一个 tool(cc 或 cx);按 chat id 各建一份 ChatContext,
 /// 不同用户并行、各记各的目录与上下文,同一用户串行,所以谁也不串话、谁也卡不住谁。
 final class TelegramBot {
+    struct FileAttachment {
+        let kind: String
+        let fileID: String
+        let fileUniqueID: String?
+        let fileName: String?
+        let mimeType: String?
+        let size: Int?
+    }
+
+    struct SendFileResult {
+        let ok: Bool
+        let error: String
+    }
+
     private let token: String
     private let tool: FeedTool
+    private let instanceLabel: String
+    private let ioTagPrefix: String
     private let home: String                  // 新用户的默认工作目录
     private let allowedChatIDs: Set<String>
     /// 桌宠联动回调:phase ∈ "start"(收到消息开干) / "done"(干完);summary 给横幅。主线程里调。
@@ -850,20 +1155,27 @@ final class TelegramBot {
 
     /// 按远程发送者索引的会话态。私聊时发送者 id 通常等于 chat id;群里按发送者拆开,避免多人共享上下文。
     private var contexts: [String: ChatContext] = [:]
+    /// 按发送者记最近一次文件任务,让后续纯文字可以继续二次修改上一个文件。
+    private var recentFileTasks: [String: RemoteFileTask] = [:]
     private var offset = 0
     private var running = false
     private let urlSession: URLSession
+    private static let messageTimeout: TimeInterval = 25
+    private static let fileUploadTimeout: TimeInterval = 300
+    private static let rawDownloadTimeout: TimeInterval = 75
 
-    init(token: String, tool: FeedTool, home: String, allowedChatIDs: Set<String>,
+    init(token: String, tool: FeedTool, instanceLabel: String, ioTagPrefix: String, home: String, allowedChatIDs: Set<String>,
          onActivity: @escaping (FeedTool, String, String?) -> Void) {
         self.token = token
         self.tool = tool
+        self.instanceLabel = instanceLabel
+        self.ioTagPrefix = ioTagPrefix
         self.home = home
         self.allowedChatIDs = allowedChatIDs
         self.onActivity = onActivity
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 70   // long polling timeout=50,留余量
-        cfg.timeoutIntervalForResource = 120
+        cfg.timeoutIntervalForResource = 600
         self.urlSession = URLSession(configuration: cfg)
     }
 
@@ -871,9 +1183,9 @@ final class TelegramBot {
     private func context(for remoteUserID: String) -> ChatContext {
         if let ctx = contexts[remoteUserID] { return ctx }
         let tag = tool == .codex ? "cx" : "cc"
-        let ctx = ChatContext(tool: tool, cwd: home, label: "claudepet.remote.\(tag).\(remoteUserID)")
+        let ctx = ChatContext(tool: tool, cwd: home, label: "claudepet.remote.\(tag).\(ioTagPrefix).\(remoteUserID)")
         contexts[remoteUserID] = ctx
-        PetView.log("Telegram[\(tool.label)] 新建会话 user \(remoteUserID),默认目录 \(home)")
+        PetView.log("Telegram[\(instanceLabel)] 新建会话 user \(remoteUserID),默认目录 \(home)")
         return ctx
     }
 
@@ -881,7 +1193,7 @@ final class TelegramBot {
         guard !running else { return }
         running = true
         Thread.detachNewThread { [weak self] in self?.loop() }
-        PetView.log("Telegram[\(tool.label)] 轮询启动,默认目录 \(home)")
+        PetView.log("Telegram[\(instanceLabel)] 轮询启动,默认目录 \(home)")
     }
 
     func stop() { running = false }
@@ -909,18 +1221,19 @@ final class TelegramBot {
         ]
         guard let obj = syncGET(comps.url) else { return nil }
         guard (obj["ok"] as? Bool) == true else {
-            PetView.log("Telegram[\(tool.label)] getUpdates 非 ok: \(obj["description"] as? String ?? "?")")
+            PetView.log("Telegram[\(instanceLabel)] getUpdates 非 ok: \(obj["description"] as? String ?? "?")")
             return nil
         }
         return obj["result"] as? [[String: Any]] ?? []
     }
 
-    /// 处理一条 update:白名单校验 → 取该 chat 的会话态 → 指令(/cd /pwd /new /help)或普通消息(喂 agent)。
+    /// 处理一条 update:白名单校验 → 取该 chat 的会话态 → 指令(/cd /pwd /new /help)、文件任务或普通消息(喂 agent)。
     private func handle(_ update: [String: Any]) {
         guard let message = update["message"] as? [String: Any],
-              let text = (message["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !text.isEmpty,
               let chat = message["chat"] as? [String: Any] else { return }
+        let text = TelegramBot.messageText(from: message)
+        let attachments = TelegramBot.fileAttachments(from: message)
+        guard !text.isEmpty || !attachments.isEmpty else { return }
         let chatID = String(describing: chat["id"] ?? "")
         // 发起人可读名:优先 @username,退而 first_name + last_name,再退 chat id。供任务监控展示"具体谁发起的"。
         let senderName = TelegramBot.senderDisplayName(from: message["from"] as? [String: Any], chatID: chatID)
@@ -928,17 +1241,29 @@ final class TelegramBot {
 
         // 白名单:非空时只认名单内 chat;空名单放行但记日志提醒主公尽快设白名单。
         if !allowedChatIDs.isEmpty, !allowedChatIDs.contains(chatID) {
-            PetView.log("Telegram[\(tool.label)] 拒收 chat \(chatID)(不在白名单)")
+            PetView.log("Telegram[\(instanceLabel)] 拒收 chat \(chatID)(不在白名单)")
             sendMessage(chatID: chatID, text: "你不在白名单里,无法下发指令。")
             return
         }
         if allowedChatIDs.isEmpty {
-            PetView.log("Telegram[\(tool.label)] 警告:未设白名单,chat \(chatID) 已放行")
+            PetView.log("Telegram[\(instanceLabel)] 警告:未设白名单,chat \(chatID) 已放行")
         }
 
         let ctx = context(for: remoteUserID)
+        if !attachments.isEmpty {
+            handleFileMessage(attachments: attachments, text: text, ctx: ctx, chatID: chatID,
+                              remoteUserID: remoteUserID, senderName: senderName)
+            return
+        }
+
+        if shouldContinueRecentFileTask(text), let fileTask = recentFileTask(for: remoteUserID) {
+            handleFollowUpFileTask(text: text, fileTask: fileTask, ctx: ctx, chatID: chatID,
+                                   remoteUserID: remoteUserID, senderName: senderName)
+            return
+        }
+
         switch RemoteBotSetup.handle(platform: "telegram", remoteUserID: remoteUserID,
-                                     botID: RemoteBotSetup.botID(for: tool), toolLabel: tool.label,
+                                     botID: ioTagPrefix, toolLabel: tool.label,
                                      incoming: text) {
         case .reply(let reply, let resetSession):
             if resetSession { ctx.setSessionID(nil) }
@@ -952,6 +1277,146 @@ final class TelegramBot {
             }
             runAgent(prompt: personalizedPrompt, originalPrompt: text, ctx: ctx, chatID: chatID,
                      remoteUserID: remoteUserID, senderName: senderName)
+        }
+    }
+
+    /// 判断纯文字是否明显在继续修改上一份文件,避免普通闲聊误绑到文件任务。
+    private func shouldContinueRecentFileTask(_ text: String) -> Bool {
+        let value = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !value.hasPrefix("/") else { return false }
+        let needles = ["继续", "再", "二次", "修改", "改", "调整", "换", "加", "去掉", "删除", "放大", "缩小",
+                       "变成", "改成", "重新", "上一张", "上一个", "上一份", "刚才", "刚刚", "这个", "那个",
+                       "图片", "照片", "图", "文件", "文档", "表格", "pdf", "word", "excel", "csv", "json",
+                       "音频", "视频", "压缩包", "附件", "处理", "完成", "完了吗", "好了没", "好了吗", "结束",
+                       "continue", "again", "modify", "edit", "change", "previous", "last file", "last document",
+                       "last image", "file", "document", "attachment", "done", "finished", "complete"]
+        return needles.contains { value.contains($0) }
+    }
+
+    private func recentFileTask(for remoteUserID: String) -> RemoteFileTask? {
+        if let task = recentFileTasks[remoteUserID] { return task }
+        guard let task = RemoteFileTask.latestExisting(platform: "telegram", botID: ioTagPrefix, remoteUserID: remoteUserID) else {
+            return nil
+        }
+        recentFileTasks[remoteUserID] = task
+        PetView.log("Telegram[\(instanceLabel)] user \(remoteUserID) 从磁盘恢复最近文件任务 \(task.taskID)")
+        return task
+    }
+
+    private func handleFollowUpFileTask(text: String, fileTask: RemoteFileTask, ctx: ChatContext, chatID: String,
+                                        remoteUserID: String, senderName: String) {
+        let prompt = fileTask.followUpPrompt(userRequest: text)
+        switch RemoteBotSetup.handle(platform: "telegram", remoteUserID: remoteUserID,
+                                     botID: ioTagPrefix, toolLabel: tool.label,
+                                     incoming: prompt) {
+        case .reply(let reply, let resetSession):
+            if resetSession { ctx.setSessionID(nil) }
+            sendMessage(chatID: chatID, text: reply)
+        case .proceed(let personalizedPrompt):
+            guard ctx.tryBegin() else {
+                sendMessage(chatID: chatID, text: "上一条还在处理,等它答完后再继续。")
+                return
+            }
+            runAgent(prompt: personalizedPrompt, originalPrompt: text, ctx: ctx, chatID: chatID,
+                     remoteUserID: remoteUserID, senderName: senderName, fileTask: fileTask)
+        }
+    }
+
+    /// Telegram 文本优先取 text,文件说明取 caption。
+    static func messageText(from message: [String: Any]) -> String {
+        let raw = (message["text"] as? String) ?? (message["caption"] as? String) ?? ""
+        return raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// 从 Telegram message 中提取所有带 file_id 的常见文件类型。photo 只取最大尺寸,避免同一照片重复下载。
+    static func fileAttachments(from message: [String: Any]) -> [FileAttachment] {
+        var result: [FileAttachment] = []
+        func item(_ kind: String, _ raw: [String: Any], defaultName: String? = nil, mimeType: String? = nil) -> FileAttachment? {
+            guard let fileID = raw["file_id"] as? String, !fileID.isEmpty else { return nil }
+            return FileAttachment(kind: kind,
+                                  fileID: fileID,
+                                  fileUniqueID: raw["file_unique_id"] as? String,
+                                  fileName: (raw["file_name"] as? String) ?? defaultName,
+                                  mimeType: (raw["mime_type"] as? String) ?? mimeType,
+                                  size: raw["file_size"] as? Int)
+        }
+        if let raw = message["document"] as? [String: Any], let f = item("document", raw) { result.append(f) }
+        if let photos = message["photo"] as? [[String: Any]], let raw = photos.max(by: {
+            (($0["file_size"] as? Int) ?? (($0["width"] as? Int) ?? 0) * (($0["height"] as? Int) ?? 0))
+            < (($1["file_size"] as? Int) ?? (($1["width"] as? Int) ?? 0) * (($1["height"] as? Int) ?? 0))
+        }), let f = item("photo", raw, defaultName: "photo.jpg", mimeType: "image/jpeg") { result.append(f) }
+        if let raw = message["video"] as? [String: Any], let f = item("video", raw, defaultName: "video.mp4", mimeType: "video/mp4") { result.append(f) }
+        if let raw = message["audio"] as? [String: Any], let f = item("audio", raw, defaultName: "audio.mp3") { result.append(f) }
+        if let raw = message["voice"] as? [String: Any], let f = item("voice", raw, defaultName: "voice.ogg", mimeType: "audio/ogg") { result.append(f) }
+        if let raw = message["animation"] as? [String: Any], let f = item("animation", raw, defaultName: "animation.mp4") { result.append(f) }
+        if let raw = message["sticker"] as? [String: Any] {
+            let ext = (raw["is_video"] as? Bool) == true ? "webm" : ((raw["is_animated"] as? Bool) == true ? "tgs" : "webp")
+            if let f = item("sticker", raw, defaultName: "sticker.\(ext)") { result.append(f) }
+        }
+        if let raw = message["video_note"] as? [String: Any], let f = item("video_note", raw, defaultName: "video-note.mp4", mimeType: "video/mp4") { result.append(f) }
+        return result
+    }
+
+    /// 文件消息先落隔离目录,再把任务目录交给 agent。下载失败不会进入执行链路。
+    private func handleFileMessage(attachments: [FileAttachment], text: String, ctx: ChatContext, chatID: String,
+                                   remoteUserID: String, senderName: String) {
+        let task: RemoteFileTask
+        do {
+            task = try RemoteFileTask.create(platform: "telegram", botID: ioTagPrefix, remoteUserID: remoteUserID)
+        } catch {
+            PetView.log("Telegram[\(instanceLabel)] 创建文件任务目录失败:\(error.localizedDescription)")
+            sendMessage(chatID: chatID, text: "文件接收失败:无法创建任务目录。")
+            return
+        }
+
+        var saved: [RemoteFileTask.InputFile] = []
+        var failures: [String] = []
+        for attachment in attachments {
+            do {
+                let file = try downloadAttachment(attachment, into: task)
+                saved.append(file)
+            } catch {
+                failures.append("\(attachment.kind):\(error.localizedDescription)")
+            }
+        }
+        do {
+            try task.writeMeta(chatID: chatID, senderName: senderName, toolLabel: tool.label,
+                               requestText: text, files: saved)
+        } catch {
+            failures.append("meta:\(error.localizedDescription)")
+        }
+
+        guard !saved.isEmpty else {
+            PetView.log("Telegram[\(instanceLabel)] 文件下载失败:\(failures.joined(separator: "; "))")
+            sendMessage(chatID: chatID, text: "文件接收失败:下载文件没有成功。")
+            return
+        }
+
+        let prompt = task.prompt(userRequest: text, files: saved)
+        switch RemoteBotSetup.handle(platform: "telegram", remoteUserID: remoteUserID,
+                                     botID: ioTagPrefix, toolLabel: tool.label,
+                                     incoming: prompt) {
+        case .reply(let reply, let resetSession):
+            if resetSession { ctx.setSessionID(nil) }
+            sendMessage(chatID: chatID, text: """
+            文件已收到。当前 Bot 需要先完成设置:
+            \(reply)
+            """)
+            return
+        case .proceed(let personalizedPrompt):
+            guard ctx.tryBegin() else {
+                sendMessage(chatID: chatID, text: "文件已收到。上一条还在处理,等它答完后再继续。")
+                return
+            }
+            if !failures.isEmpty {
+                PetView.log("Telegram[\(instanceLabel)] 部分文件处理异常:\(failures.joined(separator: "; "))")
+                sendMessage(chatID: chatID, text: "部分文件接收失败,已继续处理成功收到的文件。")
+            }
+            recentFileTasks[remoteUserID] = task
+            PetView.log("Telegram[\(instanceLabel)] user \(remoteUserID) 最近文件任务更新为 \(task.taskID)")
+            let names = saved.map(\.storedName).joined(separator: ", ")
+            runAgent(prompt: personalizedPrompt, originalPrompt: text.isEmpty ? "Telegram 文件任务:\(names)" : text,
+                     ctx: ctx, chatID: chatID, remoteUserID: remoteUserID, senderName: senderName, fileTask: task)
         }
     }
 
@@ -994,7 +1459,7 @@ final class TelegramBot {
             sendMessage(chatID: chatID, text: "已开新会话,之前的上下文清空。")
         case "/help", "/start":
             sendMessage(chatID: chatID, text: """
-            我是 \(tool.label) 远程遥控。直接发消息我就替你干活;支持:
+            我是 \(tool.label) 远程遥控。直接发消息或文件我就替你干活;支持:
             /cd <路径>  切换工作目录(并开新会话)
             /pwd        看当前目录
             /new        开新会话(清上下文)
@@ -1002,6 +1467,7 @@ final class TelegramBot {
             /profile    查看当前 Bot 设置
             /reset      清空当前 Bot 设置并重新引导
             /help       这条帮助
+            发文件时可在 caption 写处理要求;结果文件请让 agent 放到 outbox,会自动回传。
             当前目录:\(ctx.cwd)
             """)
         default:
@@ -1013,32 +1479,37 @@ final class TelegramBot {
     /// 流程:桌宠开跑 → 先占一条进度消息 → 边跑边把 cc/cx 的步骤原地编辑进这条消息 → 写回会话 id、解忙 → 收尾进度 + 另发最终正文 → 桌宠收工。
     /// 调用前 handle 已 tryBegin() 占用。进度回调在 AgentRunner 的读取线程里触发,经 ProgressPanel 节流后才真正发编辑请求,避免触发 Telegram 限流。
     private func runAgent(prompt: String, originalPrompt: String, ctx: ChatContext, chatID: String,
-                          remoteUserID: String, senderName: String) {
+                          remoteUserID: String, senderName: String, fileTask: RemoteFileTask? = nil) {
         let tool = self.tool
         ctx.queue.async { [weak self] in
             guard let self = self else { return }
             DispatchQueue.main.async { self.onActivity(tool, "start", nil) }
-            PetView.log("Telegram[\(tool.label)] user \(remoteUserID) 收到 \(originalPrompt.count) 字,开跑")
+            PetView.log("Telegram[\(self.instanceLabel)] user \(remoteUserID) 收到 \(originalPrompt.count) 字,开跑")
             let startedAt = Date()   // 墙钟计时起点:供任务监控算"运行了多长时间"
 
             // 先占一条进度消息,随后原地编辑刷新;拿不到 message_id 则退化为只在跑完发结果。
-            let panelID = self.sendMessage(chatID: chatID, text: "🤖 收到,开跑…")
-            let panel = ProgressPanel(title: "\(tool.label) 远程进度")
+            let panelID = self.sendMessage(chatID: chatID, text: fileTask == nil ? "🤖 收到,开跑…" : "🤖 文件已收到,开始处理…")
+            let panel = fileTask == nil
+                ? ProgressPanel(title: "\(tool.label) 远程进度")
+                : ProgressPanel(title: "文件处理中", maxLines: 3)
 
             let snap = ctx.snapshot()
-            let reply = AgentRunner.run(tool: tool, prompt: prompt, sessionID: snap.sessionID,
-                                        cwd: snap.cwd, ioTag: chatID) { [weak self] line in
+            let runCwd = fileTask?.root.path ?? snap.cwd
+            let runSessionID = fileTask == nil ? snap.sessionID : nil
+            let reply = AgentRunner.run(tool: tool, prompt: prompt, sessionID: runSessionID,
+                                        cwd: runCwd, ioTag: "\(self.ioTagPrefix)-\(chatID)") { [weak self] line in
                 guard let self = self, let panelID = panelID else { return }
-                panel.append(line)
+                guard let visibleLine = self.userFacingProgress(line, fileTask: fileTask) else { return }
+                panel.append(visibleLine)
                 if panel.shouldFlush() { self.editMessageText(chatID: chatID, messageID: panelID, text: panel.render()) }
             }
-            ctx.setSessionID(reply.sessionID)
+            if fileTask == nil { ctx.setSessionID(reply.sessionID) }
             ctx.end()
 
             // 任务监控:落盘本轮"问题→答案"连同发起人、耗时、花费(开关关闭时 record 内部直接跳过)。
             DispatchQueue.main.async {
                 TaskMonitor.record(source: "telegram", tool: tool, initiatorID: remoteUserID, initiatorName: senderName,
-                                   cwd: snap.cwd, question: originalPrompt, answer: reply.text,
+                                   cwd: runCwd, question: originalPrompt, answer: reply.text,
                                    startedAt: startedAt, endedAt: Date(), status: reply.status,
                                    sessionID: reply.sessionID, metrics: reply.metrics)
             }
@@ -1047,13 +1518,102 @@ final class TelegramBot {
             if let panelID = panelID {
                 self.editMessageText(chatID: chatID, messageID: panelID, text: panel.renderDone())
             }
-            self.sendMessage(chatID: chatID, text: reply.text)
+            self.sendMessage(chatID: chatID, text: self.userFacingReply(reply.text, fileTask: fileTask))
+            if let fileTask = fileTask {
+                self.sendOutboxFiles(chatID: chatID, fileTask: fileTask)
+            }
             let summary = reply.text.split(whereSeparator: \.isNewline).first.map(String.init) ?? reply.text
             DispatchQueue.main.async { self.onActivity(tool, "done", String(summary.prefix(40))) }
         }
     }
 
     // MARK: 回话
+    /// 下载 Telegram 文件到当前任务 inbox。文件名优先用消息自带名称,再退到 getFile 返回路径的文件名。
+    private func downloadAttachment(_ attachment: FileAttachment, into task: RemoteFileTask) throws -> RemoteFileTask.InputFile {
+        var comps = URLComponents(string: "https://api.telegram.org/bot\(token)/getFile")!
+        comps.queryItems = [URLQueryItem(name: "file_id", value: attachment.fileID)]
+        guard let obj = syncGET(comps.url),
+              (obj["ok"] as? Bool) == true,
+              let result = obj["result"] as? [String: Any],
+              let filePath = result["file_path"] as? String,
+              !filePath.isEmpty else {
+            throw NSError(domain: "ClaudePetTelegramFile", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "getFile 没有返回可下载路径"])
+        }
+        let remoteName = attachment.fileName ?? URL(fileURLWithPath: filePath).lastPathComponent
+        let dest = task.reserveInboxURL(fileName: remoteName)
+        let encodedPath = filePath.split(separator: "/").map { part in
+            String(part).addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? String(part)
+        }.joined(separator: "/")
+        guard let url = URL(string: "https://api.telegram.org/file/bot\(token)/\(encodedPath)"),
+              let data = syncRawData(URLRequest(url: url)) else {
+            throw NSError(domain: "ClaudePetTelegramFile", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey: "下载文件失败"])
+        }
+        try data.write(to: dest, options: .atomic)
+        return RemoteFileTask.InputFile(sourceKind: attachment.kind,
+                                        fileID: attachment.fileID,
+                                        originalName: remoteName,
+                                        storedName: dest.lastPathComponent,
+                                        path: dest.path,
+                                        size: attachment.size ?? data.count,
+                                        mimeType: attachment.mimeType)
+    }
+
+    /// 只上传当前任务 outbox 的普通文件,不接受任意路径。
+    private func sendOutboxFiles(chatID: String, fileTask: RemoteFileTask) {
+        let files = fileTask.outboxFiles()
+        guard !files.isEmpty else { return }
+        var sent = 0
+        for file in files {
+            let result = sendDocument(chatID: chatID, fileURL: file, caption: file.lastPathComponent)
+            if result.ok {
+                sent += 1
+            } else {
+                let detail = result.error.isEmpty ? "未知错误" : result.error
+                PetView.log("Telegram[\(instanceLabel)] sendDocument 失败 \(file.path): \(detail)")
+                sendMessage(chatID: chatID, text: "回传失败:\(file.lastPathComponent)\n原因:\(detail)")
+            }
+        }
+        if sent > 0 {
+            sendMessage(chatID: chatID, text: sent == files.count ? "结果文件已回传。" : "部分结果文件已回传。")
+        }
+        PetView.log("Telegram[\(instanceLabel)] 文件任务 \(fileTask.taskID) outbox 回传 \(sent)/\(files.count)")
+    }
+
+    /// 文件任务回复给用户时去掉内部路径和长篇过程,内部日志仍保留完整信息。
+    private func userFacingReply(_ text: String, fileTask: RemoteFileTask?) -> String {
+        guard fileTask != nil else { return text }
+        let blocked = ["ClaudePetRemoteFiles", "/Users/", "/var/", "inbox/", "work/", "outbox/", "meta.json",
+                       "本次 Telegram 文件任务目录", "收到的原始文件", "处理中间文件", "需要回传",
+                       "```bash", "```sh", "```zsh", "```shell", "$ ", "/bin/", "/usr/bin/", "/opt/homebrew/",
+                       "命令:", "命令：", "执行命令", "运行命令", "command:"]
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+            .filter { line in !blocked.contains { line.contains($0) } }
+        let compact = lines.joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let fallback = "处理完成。结果文件如已生成会自动回传。"
+        let value = compact.isEmpty ? fallback : compact
+        return value.count > 1200 ? String(value.prefix(1200)) + "\n…（已省略部分过程）" : value
+    }
+
+    /// Telegram 用户侧进度不暴露命令、路径、工具参数。完整细节只保留在本机日志和任务目录里。
+    private func userFacingProgress(_ line: String, fileTask: RemoteFileTask?) -> String? {
+        if fileTask != nil {
+            if line.contains("已就绪") || line.contains("开跑") { return "🟢 已开始处理文件" }
+            if line.contains("改动文件") { return "📝 正在生成结果" }
+            if line.hasPrefix("💬") { return nil }
+            return "🔄 正在处理文件…"
+        }
+        let sensitive = ["$ ", "/Users/", "/var/", "/bin/", "/usr/bin/", "/opt/homebrew/",
+                         "ClaudePetRemoteFiles", "inbox/", "work/", "outbox/", "meta.json"]
+        if line.hasPrefix("🔧") || sensitive.contains(where: { line.contains($0) }) {
+            return "🔧 正在处理"
+        }
+        return line
+    }
+
     /// 发消息回 Telegram;>4000 字按段切(上限 4096),逐段发。返回最后一段的 message_id(占位进度消息靠它后续原地编辑)。
     @discardableResult
     private func sendMessage(chatID: String, text: String) -> Int? {
@@ -1061,6 +1621,7 @@ final class TelegramBot {
         for chunk in TelegramBot.chunks(text, limit: 4000) {
             var req = URLRequest(url: URL(string: "https://api.telegram.org/bot\(token)/sendMessage")!)
             req.httpMethod = "POST"
+            req.timeoutInterval = Self.messageTimeout
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             let body: [String: Any] = ["chat_id": chatID, "text": chunk]
             req.httpBody = try? JSONSerialization.data(withJSONObject: body)
@@ -1070,10 +1631,52 @@ final class TelegramBot {
         return lastMessageID
     }
 
+    /// 用 multipart/form-data 回传单个普通文件。
+    func sendDocument(chatID: String, fileURL: URL, caption: String?) -> SendFileResult {
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: fileURL.path, isDirectory: &isDir), !isDir.boolValue,
+              let data = try? Data(contentsOf: fileURL) else {
+            return SendFileResult(ok: false, error: "本地文件不存在或不可读")
+        }
+        let boundary = "ClaudePetBoundary-\(UUID().uuidString)"
+        var body = Data()
+        func append(_ text: String) { body.append(Data(text.utf8)) }
+        func field(_ name: String, _ value: String) {
+            append("--\(boundary)\r\n")
+            append("Content-Disposition: form-data; name=\"\(name)\"\r\n\r\n")
+            append(value)
+            append("\r\n")
+        }
+        field("chat_id", chatID)
+        if let caption = caption, !caption.isEmpty { field("caption", String(caption.prefix(1000))) }
+        let fileName = RemoteFileTask.sanitizeFileName(fileURL.lastPathComponent, fallback: "result")
+        let headerFileName = TelegramBot.asciiMultipartFileName(fileName)
+        append("--\(boundary)\r\n")
+        append("Content-Disposition: form-data; name=\"document\"; filename=\"\(headerFileName)\"\r\n")
+        append("Content-Type: \(TelegramBot.mimeType(for: fileURL))\r\n\r\n")
+        body.append(data)
+        append("\r\n--\(boundary)--\r\n")
+
+        var req = URLRequest(url: URL(string: "https://api.telegram.org/bot\(token)/sendDocument")!)
+        req.httpMethod = "POST"
+        req.timeoutInterval = Self.fileUploadTimeout
+        req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        req.httpBody = body
+        PetView.log("Telegram[\(instanceLabel)] sendDocument 开始 \(fileURL.lastPathComponent),\(data.count) 字节")
+        let result = syncTelegramAPI(req)
+        guard let obj = result.object else {
+            return SendFileResult(ok: false, error: result.error.isEmpty ? "Telegram 没有返回可解析 JSON" : result.error)
+        }
+        if (obj["ok"] as? Bool) == true { return SendFileResult(ok: true, error: "") }
+        let description = obj["description"] as? String ?? result.error
+        return SendFileResult(ok: false, error: description.isEmpty ? "Telegram 返回 ok=false" : description)
+    }
+
     /// 原地编辑既有消息(进度面板刷新用)。Telegram 对"内容未变"会回 400,无害,忽略。
     private func editMessageText(chatID: String, messageID: Int, text: String) {
         var req = URLRequest(url: URL(string: "https://api.telegram.org/bot\(token)/editMessageText")!)
         req.httpMethod = "POST"
+        req.timeoutInterval = Self.messageTimeout
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         let body: [String: Any] = ["chat_id": chatID, "message_id": messageID, "text": text]
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
@@ -1107,7 +1710,9 @@ final class TelegramBot {
     // MARK: HTTP 同步原语(轮询线程本就阻塞,同步最直白)
     private func syncGET(_ url: URL?) -> [String: Any]? {
         guard let url = url else { return nil }
-        return syncData(URLRequest(url: url))
+        var req = URLRequest(url: url)
+        req.timeoutInterval = Self.rawDownloadTimeout
+        return syncData(req)
     }
 
     private func syncData(_ request: URLRequest) -> [String: Any]? {
@@ -1120,8 +1725,97 @@ final class TelegramBot {
             result = obj
         }
         task.resume()
-        sem.wait()
+        if sem.wait(timeout: .now() + requestTimeout(request, fallback: Self.rawDownloadTimeout)) == .timedOut {
+            task.cancel()
+            PetView.log("Telegram[\(instanceLabel)] HTTP 请求超时 \(request.url?.lastPathComponent ?? "?")")
+            return nil
+        }
         return result
+    }
+
+    private func syncTelegramAPI(_ request: URLRequest) -> (object: [String: Any]?, error: String) {
+        let sem = DispatchSemaphore(value: 0)
+        var object: [String: Any]?
+        var message = ""
+        let task = urlSession.dataTask(with: request) { data, response, error in
+            defer { sem.signal() }
+            if let error = error {
+                message = error.localizedDescription
+                return
+            }
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard let data = data, !data.isEmpty else {
+                message = "HTTP \(status),响应体为空"
+                return
+            }
+            if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                object = obj
+                if (obj["ok"] as? Bool) != true {
+                    let desc = obj["description"] as? String ?? String(data: data, encoding: .utf8) ?? ""
+                    message = "HTTP \(status),\(desc)"
+                }
+                return
+            }
+            let raw = String(data: data.prefix(500), encoding: .utf8) ?? "\(data.count) 字节非 UTF-8 响应"
+            message = "HTTP \(status),响应不是 JSON:\(raw)"
+        }
+        task.resume()
+        if sem.wait(timeout: .now() + requestTimeout(request, fallback: Self.fileUploadTimeout)) == .timedOut {
+            task.cancel()
+            let seconds = Int(requestTimeout(request, fallback: Self.fileUploadTimeout))
+            return (nil, "请求超时(\(seconds)秒),请检查 Telegram 网络或代理")
+        }
+        return (object, message)
+    }
+
+    private func syncRawData(_ request: URLRequest) -> Data? {
+        let sem = DispatchSemaphore(value: 0)
+        var result: Data?
+        let task = urlSession.dataTask(with: request) { data, response, error in
+            defer { sem.signal() }
+            guard error == nil,
+                  let http = response as? HTTPURLResponse,
+                  (200..<300).contains(http.statusCode),
+                  let data = data else { return }
+            result = data
+        }
+        task.resume()
+        if sem.wait(timeout: .now() + requestTimeout(request, fallback: Self.rawDownloadTimeout)) == .timedOut {
+            task.cancel()
+            PetView.log("Telegram[\(instanceLabel)] 原始文件下载超时 \(request.url?.lastPathComponent ?? "?")")
+            return nil
+        }
+        return result
+    }
+
+    private func requestTimeout(_ request: URLRequest, fallback: TimeInterval) -> TimeInterval {
+        let timeout = request.timeoutInterval > 0 ? request.timeoutInterval : fallback
+        return timeout + 5
+    }
+
+    static func asciiMultipartFileName(_ raw: String) -> String {
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+        let cleaned = raw.unicodeScalars.map { allowed.contains($0) ? Character($0) : "_" }
+        let value = String(cleaned).trimmingCharacters(in: CharacterSet(charactersIn: "._-"))
+        return value.isEmpty ? "result.bin" : String(value.prefix(120))
+    }
+
+    static func mimeType(for url: URL) -> String {
+        switch url.pathExtension.lowercased() {
+        case "gif": return "image/gif"
+        case "jpg", "jpeg": return "image/jpeg"
+        case "png": return "image/png"
+        case "webp": return "image/webp"
+        case "pdf": return "application/pdf"
+        case "txt", "md", "log": return "text/plain"
+        case "csv": return "text/csv"
+        case "json": return "application/json"
+        case "zip": return "application/zip"
+        case "mp4": return "video/mp4"
+        case "mp3": return "audio/mpeg"
+        case "ogg": return "audio/ogg"
+        default: return "application/octet-stream"
+        }
     }
 }
 
@@ -1147,12 +1841,14 @@ final class RemoteControl {
         }
         let home = FileManager.default.homeDirectoryForCurrentUser.path
 
-        // Telegram:cc/cx 各自 token 非空才起。
+        // Telegram:cc/cx 各自可填多枚 token;每枚 token 启一个独立 bot,适合每个人一枚专属 bot。
         let allow = Settings.telegramAllowedChatIDSet
-        let claudeToken = Settings.telegramClaudeToken
-        let codexToken = Settings.telegramCodexToken
-        if !claudeToken.isEmpty { bots.append(makeBot(token: claudeToken, tool: .claude, home: home, allow: allow)) }
-        if !codexToken.isEmpty { bots.append(makeBot(token: codexToken, tool: .codex, home: home, allow: allow)) }
+        for (idx, token) in Settings.telegramClaudeTokens.enumerated() {
+            bots.append(makeBot(token: token, tool: .claude, home: home, allow: allow, index: idx + 1))
+        }
+        for (idx, token) in Settings.telegramCodexTokens.enumerated() {
+            bots.append(makeBot(token: token, tool: .codex, home: home, allow: allow, index: idx + 1))
+        }
         bots.forEach { $0.start() }
 
         // 飞书:cc/cx 各自的应用凭证(app_id + app_secret)齐全才起。
@@ -1171,8 +1867,11 @@ final class RemoteControl {
         RemoteFeatureAnnouncement.pushIfNeeded()
     }
 
-    private func makeBot(token: String, tool: FeedTool, home: String, allow: Set<String>) -> TelegramBot {
-        return TelegramBot(token: token, tool: tool, home: home, allowedChatIDs: allow) { [weak self] tool, phase, summary in
+    private func makeBot(token: String, tool: FeedTool, home: String, allow: Set<String>, index: Int) -> TelegramBot {
+        let tag = tool == .codex ? "cx" : "cc"
+        let label = "\(tool.label)#\(index)"
+        return TelegramBot(token: token, tool: tool, instanceLabel: label, ioTagPrefix: "\(tag)-bot\(index)",
+                           home: home, allowedChatIDs: allow) { [weak self] tool, phase, summary in
             self?.onActivity?(tool, phase, summary)
         }
     }
@@ -1274,10 +1973,9 @@ enum RemoteFeatureAnnouncement {
     static func pendingTelegramTargets() -> [Target] {
         let chats = Settings.telegramAllowedChatIDSet.sorted()
         guard !chats.isEmpty else { return [] }
-        let bots: [(String, String)] = [
-            ("claude", Settings.telegramClaudeToken),
-            ("codex", Settings.telegramCodexToken),
-        ].filter { !$0.1.isEmpty }
+        let bots: [(String, String)] =
+            Settings.telegramClaudeTokens.enumerated().map { ("cc-bot\($0.offset + 1)", $0.element) } +
+            Settings.telegramCodexTokens.enumerated().map { ("cx-bot\($0.offset + 1)", $0.element) }
         return bots.flatMap { bot in
             chats.compactMap { chat in
                 wasSent(platform: "telegram", toolID: bot.0, recipientID: chat)
@@ -1373,7 +2071,7 @@ enum RemoteFeatureAnnouncement {
 }
 
 /// 远程遥控配置窗:独立小窗,不挤进已爆满的主设置窗。手写 AppKit 绝对布局。
-/// 收总开关 + cc/cx 两个 bot token + chat id 白名单;保存即写 UserDefaults 并 RemoteControl.reload。
+/// 收总开关 + cc/cx 两组 bot token 列表 + chat id 白名单;保存即写 UserDefaults 并 RemoteControl.reload。
 @MainActor
 final class RemoteControlWindowController: NSWindowController {
     private let enabledButton = NSButton(checkboxWithTitle: "启用远程遥控(Telegram / 飞书 共用总开关)", target: nil, action: nil)
@@ -1434,9 +2132,9 @@ final class RemoteControlWindowController: NSWindowController {
 
         // ── Telegram ──
         section("Telegram", y: 652)
-        note("找 @BotFather 各建一个 bot 拿 token;给 bot 发条消息后用 getUpdates 看 chat id。", y: 634)
-        label("Claude(cc)bot token", y: 608); field(claudeTokenField, y: 584)
-        label("Codex(cx)bot token", y: 556); field(codexTokenField, y: 532)
+        note("每个人可各建专属 bot;多枚 token 用逗号/空格分隔。发消息后用 getUpdates 看 chat id。", y: 634)
+        label("Claude(cc)bot tokens(可多枚)", y: 608); field(claudeTokenField, y: 584)
+        label("Codex(cx)bot tokens(可多枚)", y: 556); field(codexTokenField, y: 532)
         label("允许的 chat id(逗号/空格分隔,留空=不限,但不安全)", y: 504); field(allowedField, y: 480)
 
         // ── 飞书 ──
@@ -1449,7 +2147,7 @@ final class RemoteControlWindowController: NSWindowController {
         label("允许的 open_id(逗号/空格分隔,留空=不限,但不安全)", y: 190); field(feishuAllowedField, y: 166)
 
         // 底部提示 + 按钮
-        let tip = NSTextField(labelWithString: "改完点「保存并应用」立即生效;凭证留空则对应 bot 不启动。\ntoken / app secret 只存本机,不入仓库。")
+        let tip = NSTextField(labelWithString: "改完点「保存并应用」立即生效;token 可多枚,留空则对应 bot 不启动。\ntoken / app secret 只存本机,不入仓库。")
         tip.textColor = .secondaryLabelColor; tip.font = .systemFont(ofSize: 11)
         tip.maximumNumberOfLines = 2
         tip.frame = NSRect(x: 24, y: 106, width: 412, height: 34)

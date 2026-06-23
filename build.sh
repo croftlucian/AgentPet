@@ -8,6 +8,8 @@ MACOS="$APP/Contents/MacOS"
 BIN="$MACOS/ClaudePet"
 CACHE="$ROOT/.build/module-cache"
 RESOURCES="$APP/Contents/Resources"
+INSTALL_APP="${INSTALL_APP:-/Applications/ClaudePet.app}"
+OPEN_AFTER_BUILD="${OPEN_AFTER_BUILD:-1}"
 
 echo "==> 清理旧产物"
 rm -rf "$APP"
@@ -86,6 +88,9 @@ chmod +x "$RESOURCES/cx"
 echo "==> code signing"
 SIGN_IDENTITY="${SIGN_IDENTITY:-}"
 if [[ -z "$SIGN_IDENTITY" ]]; then
+  SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | awk -F '"' '/ClaudePet Local Code Signing/ {print $2; exit}')"
+fi
+if [[ -z "$SIGN_IDENTITY" ]]; then
   SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | awk -F '"' '/Apple Development/ {print $2; exit}')"
 fi
 if [[ -z "$SIGN_IDENTITY" ]]; then
@@ -94,8 +99,28 @@ fi
 if [[ -n "$SIGN_IDENTITY" ]]; then
   codesign --force --sign "$SIGN_IDENTITY" "$APP" 2>/dev/null && echo "(signed with identity: ${SIGN_IDENTITY})" || echo "(identity signing failed)"
 else
-  codesign --force --sign - "$APP" 2>/dev/null && echo "(ad-hoc signed)" || echo "(signing skipped)"
+  codesign --force --sign - "$APP" 2>/dev/null && echo "(ad-hoc signed;未找到稳定签名身份,macOS 可能要求重新授予辅助功能/完全磁盘访问)" || echo "(signing skipped)"
+fi
+
+if [[ -n "$INSTALL_APP" ]]; then
+  echo "==> 安装到 $INSTALL_APP"
+  if pgrep -x ClaudePet >/dev/null 2>&1; then
+    pkill -x ClaudePet || true
+    sleep 1
+  fi
+  rm -rf "$INSTALL_APP"
+  ditto "$APP" "$INSTALL_APP"
+  echo "==> 已安装:$INSTALL_APP"
+fi
+
+if [[ "$OPEN_AFTER_BUILD" == "1" && -n "$INSTALL_APP" ]]; then
+  echo "==> 启动 $INSTALL_APP"
+  open "$INSTALL_APP"
 fi
 
 echo "==> 完成:$APP"
-echo "    启动:open \"$APP\""
+if [[ -n "$INSTALL_APP" ]]; then
+  echo "    正式启动:open \"$INSTALL_APP\""
+else
+  echo "    启动:open \"$APP\""
+fi

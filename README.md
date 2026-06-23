@@ -91,7 +91,7 @@ notify = ["/绝对路径/hooks/claudepet-notify.sh", "codex"]
 
 ## 远程遥控(Telegram / 飞书)
 
-不在电脑前也能支使 cc/cx 干活:在手机给 bot 发一句话,桌宠在本机非交互跑 `cc`(Claude)/ `cx`(Codex),干完把结果回传聊天。**Telegram、飞书两条渠道并存**,cc、cx 各占一个独立 bot / 应用——各记各的上下文。
+不在电脑前也能支使 cc/cx 干活:在手机给 bot 发一句话,桌宠在本机非交互跑 `cc`(Claude)/ `cx`(Codex),干完把结果回传聊天。**Telegram、飞书两条渠道并存**,Telegram 的 cc/cx 可各填多枚 bot token(适合每人一个专属 bot),飞书的 cc/cx 各占一个应用——各记各的上下文。
 
 > ⚠️ 它**跳过权限确认、真能改文件跑命令**(与本机 `cc` / `cx` 一脉)。务必设白名单只让自己用。功能默认关闭(Telegram 与飞书共用「启用远程遥控」总开关),token / app secret 只存本机、不入仓库。
 
@@ -116,12 +116,14 @@ notify = ["/绝对路径/hooks/claudepet-notify.sh", "codex"]
 | `/reset` | 清空当前用户当前 Bot 设置并重新引导 |
 | `/help` | 查看指令 |
 
+详细到每条命令、每个配置字段和本地排查命令的说明见 [远程遥控使用说明](docs/remote-control-usage.md)。
+
 ### Telegram 启用步骤
 
-1. Telegram 找 [@BotFather](https://t.me/BotFather) 建 **两个** bot,各拿一个 token(一个给 cc、一个给 cx);
-2. 右键桌宠 →「远程遥控(Telegram / 飞书)…」→ 勾「启用远程遥控」、填两个 token;
-3. 先给 bot 发一条消息,用 `getUpdates` 看到自己的 chat id,填进「允许的 chat id 白名单」(**强烈建议**,否则任何人都能遥控你的 Mac);
-4. 点「保存并应用」即生效;留空对应 token 的那个 bot 不启动。
+1. Telegram 找 [@BotFather](https://t.me/BotFather) 建 bot;要每个人独立入口,就给每个人各建一枚 cc bot token,需要 cx 时再各建一枚 cx bot token;
+2. 右键桌宠 →「远程遥控(Telegram / 飞书)…」→ 勾「启用远程遥控」,把多枚 token 填进 `Claude(cc)bot tokens` / `Codex(cx)bot tokens` 字段,用逗号或空格分隔;
+3. 先给每个 bot 发一条消息,用 `getUpdates` 看到自己的 chat id,填进「允许的 chat id 白名单」(**强烈建议**,否则任何人都能遥控你的 Mac);
+4. 点「保存并应用」即生效;留空对应 token 列表的那一类 bot 不启动。
 
 ### 飞书启用步骤(仅国内版 open.feishu.cn,国际版 Lark 不支持长连接)
 
@@ -185,11 +187,13 @@ notify = ["/绝对路径/hooks/claudepet-notify.sh", "codex"]
 
 ```bash
 ./build.sh                 # swiftc 编译 + 组装 .app + 写 Info.plist + 签名
-open ClaudePet.app         # 启动桌宠
+open /Applications/ClaudePet.app # 启动桌宠
 ```
 
 - 要求 macOS 13.0+、已装 Xcode Command Line Tools(`swiftc`)。
-- 首次 `open ClaudePet.app` 启动会幂等把 `cc` / `cx` 命令简写写进 `~/.zshrc`(`claude` / `codex` 放飞版,跳过确认)——换台电脑装上桌宠就自带 `cc` / `cx`,新开终端即用;已有同名 alias 原样跳过、绝不改动。`cc` 是系统 C 编译器的标准名,故只做 shell alias、不装成 PATH 可执行,以免遮蔽 `/usr/bin/cc` 害了 `make` / `./configure`。
+- `build.sh` 默认会把新版本覆盖安装到 `/Applications/ClaudePet.app` 并启动这份正式 app;如只想生成项目内 app,可用 `INSTALL_APP= OPEN_AFTER_BUILD=0 ./build.sh`。
+- 本机没有 Apple Development 或其他有效代码签名身份时会退回 ad-hoc 签名;这种签名每次代码变化都可能让 macOS 重新要求辅助功能 / 完全磁盘访问授权。
+- 首次 `open /Applications/ClaudePet.app` 启动会幂等把 `cc` / `cx` 命令简写写进 `~/.zshrc`(`claude` / `codex` 放飞版,跳过确认)——换台电脑装上桌宠就自带 `cc` / `cx`,新开终端即用;已有同名 alias 原样跳过、绝不改动。`cc` 是系统 C 编译器的标准名,故只做 shell alias、不装成 PATH 可执行,以免遮蔽 `/usr/bin/cc` 害了 `make` / `./configure`。
 - 刻意用 Swift 5 模式编译以规避严格并发误报。
 - 后台附件应用(`LSUIElement`):不占 Dock、不抢焦点,窗口浮于所有桌面/全屏之上。
 
@@ -216,8 +220,10 @@ BIN=./ClaudePet.app/Contents/MacOS/ClaudePet
 "$BIN" --ask-dryrun   <文本> [claude|codex]    # 文字投喂脚本(核对家目录与 prompt 转义)
 "$BIN" --translate-dryrun <文本>               # 翻译指令与真翻一次
 "$BIN" --notify-dryrun [claudepet://...]       # 陪跑/报喜 URL 解析与横幅文案(含 tty 与回现场去向)
+"$BIN" --telegram-token-list-dryrun <文本>     # 远程遥控:离线核对多 bot token 字段拆分/去重(脱敏打印)
 "$BIN" --telegram-dryrun <claude|codex> <文本> # 远程遥控:离线打印将执行的 cc/cx 命令(首轮+续接),不连网
 "$BIN" --telegram-stream-dryrun <claude|codex>  # 远程遥控:离线喂样本核对流式进度提取(进度行/最终正文/会话 id),不连网
+"$BIN" --telegram-file-task-dryrun             # 远程遥控:离线核对 Telegram 文件任务目录隔离/meta/outbox
 "$BIN" --telegram-live-test <claude|codex> <文本> # 远程遥控:真跑一轮打印实时进度(会真调 CLI、耗额度)
 "$BIN" --feishu-pb-test                          # 远程遥控(飞书):长连接 protobuf 帧编解码往返自测,不连网
 "$BIN" --feishu-event-dryrun                     # 远程遥控(飞书):样本事件解析自测(私聊/群@/非文字),不连网

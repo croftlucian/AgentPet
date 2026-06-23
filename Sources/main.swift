@@ -195,15 +195,23 @@ enum Settings {
         get { boolValue(remoteEnabledKey, default: false) }
         set { UserDefaults.standard.set(newValue, forKey: remoteEnabledKey) }
     }
-    /// cc(Claude)对应 bot 的 token,空串表示未配置。
+    /// cc(Claude)对应 bot 的 token 列表原文,空串表示未配置;多枚 token 用逗号或空白分隔。
     static var telegramClaudeToken: String {
         get { stringValue(telegramClaudeTokenKey, default: "").trimmingCharacters(in: .whitespacesAndNewlines) }
         set { UserDefaults.standard.set(newValue, forKey: telegramClaudeTokenKey) }
     }
-    /// cx(Codex)对应 bot 的 token,空串表示未配置。
+    /// cc(Claude)对应的 bot token 列表;去空并保持顺序去重,便于每个人一个独立 bot。
+    static var telegramClaudeTokens: [String] {
+        splitTelegramTokenList(telegramClaudeToken)
+    }
+    /// cx(Codex)对应 bot 的 token 列表原文,空串表示未配置;多枚 token 用逗号或空白分隔。
     static var telegramCodexToken: String {
         get { stringValue(telegramCodexTokenKey, default: "").trimmingCharacters(in: .whitespacesAndNewlines) }
         set { UserDefaults.standard.set(newValue, forKey: telegramCodexTokenKey) }
+    }
+    /// cx(Codex)对应的 bot token 列表;去空并保持顺序去重,便于每个人一个独立 bot。
+    static var telegramCodexTokens: [String] {
+        splitTelegramTokenList(telegramCodexToken)
     }
     /// 允许下发指令的 chat id 白名单(逗号/空白分隔)。非空时只认名单内的 chat,挡掉陌生人。
     static var telegramAllowedChatIDs: String {
@@ -216,6 +224,18 @@ enum Settings {
             .split(whereSeparator: { $0 == "," || $0 == " " || $0 == "\n" || $0 == "\t" })
             .map(String.init)
             .filter { !$0.isEmpty })
+    }
+
+    /// Telegram token 列表解析:兼容旧的单 token 配置,同时允许逗号/空白分隔多 token。
+    static func splitTelegramTokenList(_ raw: String) -> [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+        for item in raw.split(whereSeparator: { $0 == "," || $0 == " " || $0 == "\n" || $0 == "\t" }).map(String.init) {
+            guard !item.isEmpty, !seen.contains(item) else { continue }
+            seen.insert(item)
+            result.append(item)
+        }
+        return result
     }
 
     // MARK: 远程遥控(飞书 Feishu)
@@ -3692,6 +3712,19 @@ MainActor.assumeIsolated {
         exit(ok ? 0 : 2)
     }
 
+    if let idx = arguments.firstIndex(of: "--telegram-token-list-dryrun") {
+        // 自测模式:离线验证 Telegram 多 token 字段如何拆分、去空、去重;只打印脱敏摘要。
+        // 用法:--telegram-token-list-dryrun "token1, token2 token1"
+        let raw = idx + 1 < arguments.count ? arguments[idx + 1] : "111:AAA, 222:BBB 111:AAA\n333:CCC"
+        let tokens = Settings.splitTelegramTokenList(raw)
+        print("Telegram token 列表 dryrun:解析出 \(tokens.count) 枚")
+        for (i, token) in tokens.enumerated() {
+            let prefix = String(token.prefix(6))
+            print("  #\(i + 1) 长度=\(token.count) 前缀=\(prefix)…")
+        }
+        exit(0)
+    }
+
     if let idx = arguments.firstIndex(of: "--telegram-dryrun") {
         // 自测模式:离线打印远程遥控将执行的 cc/cx 命令(首轮无会话 + 续接带会话 id 两种),不连网、不起 agent 进程。
         // 复用 AgentRunner 的真函数,核对参数拼装与转义和真跑一致。用法:--telegram-dryrun <claude|codex> <文本>,默认 claude。
@@ -3758,6 +3791,38 @@ MainActor.assumeIsolated {
         print("最终正文│ \(finalText.isEmpty ? "(空)" : finalText)")
         print("会话 id │ \(sid)")
         exit(0)
+    }
+
+    if arguments.contains("--telegram-file-task-dryrun") {
+        // 自测模式:离线验证 Telegram 文件任务目录隔离、文件名清洗、meta 写入和 outbox 扫描,不连网。
+        let ok = RemoteFileTask.runSelfTest()
+        exit(ok ? 0 : 2)
+    }
+
+    if let idx = arguments.firstIndex(where: { $0 == "--telegram-send-document-test" || $0 == "--telegram-send-file" }) {
+        // 诊断模式:用当前 UserDefaults 里的第 N 枚 Telegram token 真发一个本地文件,不打印 token。
+        // 用法:--telegram-send-document-test <claude|codex> <botIndex> <chatID> <file>
+        guard idx + 4 < arguments.count else {
+            FileHandle.standardError.write(Data("用法:--telegram-send-document-test <claude|codex> <botIndex> <chatID> <file>\n别名:--telegram-send-file <claude|codex> <botIndex> <chatID> <file>\n".utf8))
+            exit(2)
+        }
+        let tool: FeedTool = arguments[idx + 1] == "claude" ? .claude : .codex
+        let botIndex = Int(arguments[idx + 2]) ?? 1
+        let chatID = arguments[idx + 3]
+        let file = URL(fileURLWithPath: (arguments[idx + 4] as NSString).expandingTildeInPath)
+        let tokens = tool == .claude ? Settings.telegramClaudeTokens : Settings.telegramCodexTokens
+        guard botIndex > 0, botIndex <= tokens.count else {
+            FileHandle.standardError.write(Data("botIndex 超出范围,当前 \(tool.label) token 数量为 \(tokens.count)\n".utf8))
+            exit(2)
+        }
+        let tag = tool == .codex ? "cx" : "cc"
+        let bot = TelegramBot(token: tokens[botIndex - 1], tool: tool, instanceLabel: "\(tool.label)#\(botIndex)",
+                              ioTagPrefix: "\(tag)-bot\(botIndex)", home: FileManager.default.homeDirectoryForCurrentUser.path,
+                              allowedChatIDs: [chatID]) { _, _, _ in }
+        let result = bot.sendDocument(chatID: chatID, fileURL: file, caption: "ClaudePet 回传诊断:\(file.lastPathComponent)")
+        print("Telegram sendDocument 诊断:\(result.ok ? "PASS" : "FAIL")")
+        if !result.error.isEmpty { print("原因:\(result.error)") }
+        exit(result.ok ? 0 : 2)
     }
 
     if let idx = arguments.firstIndex(of: "--telegram-live-test") {
