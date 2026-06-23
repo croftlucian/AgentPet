@@ -861,6 +861,76 @@ struct RemoteFileTask {
     let outbox: URL
     let meta: URL
 
+    /// 远程文件任务根目录:Application Support 下,与 monitor / profiles 同处 com.claude.pet 一棵树。
+    /// create / latestExisting / cleanup 共用此单点。
+    static func defaultBaseDirectory() -> URL {
+        URL(fileURLWithPath: RemoteBotProfileStore.dataDirectory, isDirectory: true)
+            .appendingPathComponent("remote-files", isDirectory: true)
+    }
+
+    /// 旧版根目录(home 根下的可见目录)。仅供启动迁移把历史任务搬到新位置,新代码不再往这里写。
+    static func legacyBaseDirectory() -> URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("ClaudePetRemoteFiles", isDirectory: true)
+    }
+
+    /// 把旧版 ~/ClaudePetRemoteFiles 的历史任务迁到新位置。幂等:旧目录不在即跳过,可反复调用。
+    /// 新位置整个不存在 → 整目录搬过去(同卷为原子 rename,快);新位置已存在 → 逐任务合并搬,再清掉旧空壳。
+    /// 默认走真实路径;自测传 oldBase/newBase 用临时目录,绝不碰主公真实文件。返回迁移任务数(整目录搬记 1)。
+    @discardableResult
+    static func migrateLegacyBaseIfNeeded(oldBase: URL? = nil, newBase: URL? = nil) -> Int {
+        let fm = FileManager.default
+        let oldBase = oldBase ?? legacyBaseDirectory()
+        let newBase = newBase ?? defaultBaseDirectory()
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: oldBase.path, isDirectory: &isDir), isDir.boolValue else { return 0 }
+
+        // 新位置整个不存在:直接把旧目录搬成新目录,一步到位、保留全部子结构。
+        if !fm.fileExists(atPath: newBase.path) {
+            do {
+                try fm.createDirectory(at: newBase.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try fm.moveItem(at: oldBase, to: newBase)
+                PetView.log("远程文件目录迁移:\(oldBase.path) → \(newBase.path)(整目录搬迁)")
+                return 1
+            } catch {
+                PetView.log("远程文件目录迁移失败(整目录):\(error.localizedDescription)")
+                return 0
+            }
+        }
+
+        // 新位置已存在:逐个任务合并搬,保留各自 平台/bot/user/日期 相对路径;任务名含时间+uuid,几乎不撞。
+        guard let enumerator = fm.enumerator(at: oldBase, includingPropertiesForKeys: nil) else { return 0 }
+        var taskRoots: [URL] = []
+        for case let url as URL in enumerator where url.lastPathComponent == "meta.json" {
+            taskRoots.append(url.deletingLastPathComponent())
+        }
+        // enumerator 返回的 URL 会解析符号链接(如 /var → /private/var),oldBase 可能未解析,直接字符串剥前缀会错位、
+        // 算出带 /private 的相对路径把任务搬到错位置。故两端统一 resolvingSymlinksInPath 后按路径组件相对化。
+        let oldComponents = oldBase.resolvingSymlinksInPath().pathComponents
+        var moved = 0
+        for taskRoot in taskRoots {
+            let relComponents = Array(taskRoot.resolvingSymlinksInPath().pathComponents.dropFirst(oldComponents.count))
+            guard !relComponents.isEmpty else { continue }
+            var dest = relComponents.reduce(newBase) { $0.appendingPathComponent($1, isDirectory: true) }
+            if fm.fileExists(atPath: dest.path) {   // 极罕见撞名:加 uuid 后缀,绝不覆盖
+                dest = dest.deletingLastPathComponent()
+                    .appendingPathComponent(dest.lastPathComponent + "-" + String(UUID().uuidString.prefix(4)), isDirectory: true)
+            }
+            do {
+                try fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try fm.moveItem(at: taskRoot, to: dest)
+                moved += 1
+            } catch {
+                PetView.log("远程文件目录迁移失败(任务 \(taskRoot.lastPathComponent)):\(error.localizedDescription)")
+            }
+        }
+        pruneEmptyDirectories(oldBase)
+        if let rest = try? fm.contentsOfDirectory(atPath: oldBase.path), rest.isEmpty {
+            try? fm.removeItem(at: oldBase)   // 旧 base 已全空,连根删掉免得 home 留空壳
+        }
+        if moved > 0 { PetView.log("远程文件目录迁移:合并搬迁 \(moved) 个历史任务到 \(newBase.path)") }
+        return moved
+    }
+
     static func create(platform: String, botID: String, remoteUserID: String, now: Date = Date(),
                        baseDirectory: URL? = nil) throws -> RemoteFileTask {
         let safePlatform = sanitizePathSegment(platform, fallback: "platform")
@@ -872,7 +942,7 @@ struct RemoteFileTask {
         let mm = String(format: "%02d", parts.month ?? 1)
         let dd = String(format: "%02d", parts.day ?? 1)
         let taskID = makeTaskID(date: now)
-        let base = baseDirectory ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("ClaudePetRemoteFiles", isDirectory: true)
+        let base = baseDirectory ?? defaultBaseDirectory()
         let root = base
             .appendingPathComponent(safePlatform, isDirectory: true)
             .appendingPathComponent(safeBot, isDirectory: true)
@@ -916,7 +986,7 @@ struct RemoteFileTask {
         let safePlatform = sanitizePathSegment(platform, fallback: "platform")
         let safeBot = sanitizePathSegment(botID, fallback: "bot")
         let safeUser = sanitizePathSegment(remoteUserID, fallback: "user")
-        let base = baseDirectory ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("ClaudePetRemoteFiles", isDirectory: true)
+        let base = baseDirectory ?? defaultBaseDirectory()
         let userRoot = base
             .appendingPathComponent(safePlatform, isDirectory: true)
             .appendingPathComponent(safeBot, isDirectory: true)
@@ -1068,6 +1138,195 @@ struct RemoteFileTask {
             let values = try? url.resourceValues(forKeys: [.isRegularFileKey])
             return values?.isRegularFile == true
         }.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+    }
+
+    // MARK: 清理 —— 任务目录永不回收会吃满磁盘,这里按"保留天数 + 总容量上限"定期回收旧任务
+
+    /// 清理节流:进程内记上次真扫时刻,默认 6 小时一轮,避免每条文件消息都全盘扫。NSLock 保任意线程可调。
+    private static let cleanupLock = NSLock()
+    private static var lastCleanupAt: Date?
+
+    /// 机会式清理:启动时(force=true)与每次新建任务后调用;非 force 时按 6 小时节流决定是否真扫。
+    /// 阈值读 Settings(保留天数 / 总容量 MB),≤0 表示对应维度不限。只有真删了才记日志。
+    static func maybeCleanup(force: Bool = false, now: Date = Date()) {
+        cleanupLock.lock()
+        if !force, let last = lastCleanupAt, now.timeIntervalSince(last) < 6 * 3600 {
+            cleanupLock.unlock()
+            return
+        }
+        lastCleanupAt = now
+        cleanupLock.unlock()
+        let maxMB = Settings.remoteFileMaxTotalMB
+        let maxBytes = maxMB > 0 ? Int64(maxMB) * 1024 * 1024 : 0
+        let result = cleanup(retentionDays: Settings.remoteFileRetentionDays, maxTotalBytes: maxBytes, now: now)
+        if result.removed > 0 {
+            PetView.log("远程文件清理:回收 \(result.removed) 个任务目录,释放约 \(result.freedBytes / 1024 / 1024) MB")
+        }
+    }
+
+    /// 实际清理:先按保留天数删超期任务,再按总容量上限从最旧往新删到阈值内,最后清掉清空后的空壳目录。
+    /// retentionDays ≤ 0 跳过按天清理;maxTotalBytes ≤ 0 跳过按容量清理。返回删除任务数与释放字节,供日志/自测核对。
+    @discardableResult
+    static func cleanup(retentionDays: Int, maxTotalBytes: Int64, now: Date = Date(),
+                        baseDirectory: URL? = nil) -> (removed: Int, freedBytes: Int64) {
+        let base = baseDirectory ?? defaultBaseDirectory()
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: base.path, isDirectory: &isDir), isDir.boolValue,
+              let enumerator = fm.enumerator(at: base, includingPropertiesForKeys: nil) else { return (0, 0) }
+
+        struct Item { let root: URL; let activity: Date; let size: Int64 }
+        var items: [Item] = []
+        for case let url as URL in enumerator where url.lastPathComponent == "meta.json" {
+            let root = url.deletingLastPathComponent()
+            let stats = taskStats(root)
+            items.append(Item(root: root, activity: stats.activity, size: stats.size))
+        }
+
+        var removed = 0
+        var freed: Int64 = 0
+        var survivors: [Item] = []
+        if retentionDays > 0 {
+            let cutoff = now.addingTimeInterval(-Double(retentionDays) * 86_400)
+            for item in items {
+                if item.activity < cutoff, (try? fm.removeItem(at: item.root)) != nil {
+                    removed += 1; freed += item.size
+                } else {
+                    survivors.append(item)
+                }
+            }
+        } else {
+            survivors = items
+        }
+
+        if maxTotalBytes > 0 {
+            var total = survivors.reduce(Int64(0)) { $0 + $1.size }
+            if total > maxTotalBytes {
+                for item in survivors.sorted(by: { $0.activity < $1.activity }) {
+                    if total <= maxTotalBytes { break }
+                    if (try? fm.removeItem(at: item.root)) != nil {
+                        removed += 1; freed += item.size; total -= item.size
+                    }
+                }
+            }
+        }
+
+        pruneEmptyDirectories(base)
+        return (removed, freed)
+    }
+
+    /// 一次遍历得出任务目录的占用字节与"最后活动时间"(目录树内最新文件 mtime,兜底用目录自身 mtime)。
+    /// 用最新活动而非创建时间,避免把刚被续接、outbox 刚生成结果的任务误判为过期。
+    private static func taskStats(_ root: URL) -> (size: Int64, activity: Date) {
+        let fm = FileManager.default
+        var size: Int64 = 0
+        var latest = (try? root.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? Date.distantPast
+        if let e = fm.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]) {
+            for case let url as URL in e {
+                let v = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey])
+                if v?.isRegularFile == true { size += Int64(v?.fileSize ?? 0) }
+                if let m = v?.contentModificationDate, m > latest { latest = m }
+            }
+        }
+        return (size, latest)
+    }
+
+    /// 删除清空后剩下的上层空目录(日期壳 / user / bot / platform),避免清完任务留一堆空文件夹。base 本身保留。
+    private static func pruneEmptyDirectories(_ base: URL) {
+        let fm = FileManager.default
+        guard let e = fm.enumerator(at: base, includingPropertiesForKeys: [.isDirectoryKey]) else { return }
+        var dirs: [URL] = []
+        for case let url as URL in e {
+            if (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true { dirs.append(url) }
+        }
+        // 深的先删:子目录清空后上层才会跟着变空
+        for dir in dirs.sorted(by: { $0.pathComponents.count > $1.pathComponents.count }) {
+            if let contents = try? fm.contentsOfDirectory(atPath: dir.path), contents.isEmpty {
+                try? fm.removeItem(at: dir)
+            }
+        }
+    }
+
+    /// 清理逻辑离线自测:临时目录造"超期/近期/超量"任务,核对按天删旧留新、按容量删最旧、阈值≤0 跳过、空壳回收。
+    static func runCleanupSelfTest() -> Bool {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("claudepet-file-cleanup-dryrun-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fm = FileManager.default
+        let now = Date(timeIntervalSince1970: 1_782_066_615)
+
+        func makeTask(in base: URL, ageDays: Double, bytes: Int, label: String) throws -> RemoteFileTask {
+            let created = now.addingTimeInterval(-ageDays * 86_400)
+            let t = try create(platform: "telegram", botID: "cc-bot1", remoteUserID: "u1", now: created, baseDirectory: base)
+            try Data(repeating: 0x41, count: bytes).write(to: t.inbox.appendingPathComponent("\(label).bin"))
+            try t.writeMeta(chatID: "u1", senderName: "主公", toolLabel: "cc/claude", requestText: label, files: [])
+            // 把整棵任务树 mtime 回拨到对应年龄,让 taskStats 的"最后活动时间"命中按天清理
+            try fm.setAttributes([.modificationDate: created], ofItemAtPath: t.root.path)
+            if let e = fm.enumerator(at: t.root, includingPropertiesForKeys: nil) {
+                for case let url as URL in e { try? fm.setAttributes([.modificationDate: created], ofItemAtPath: url.path) }
+            }
+            return t
+        }
+
+        do {
+            // 场景一:按天保留 14 天 —— 20 天前删、1 天前留
+            let baseA = root.appendingPathComponent("by-age", isDirectory: true)
+            let old = try makeTask(in: baseA, ageDays: 20, bytes: 1_000, label: "old")
+            let recent = try makeTask(in: baseA, ageDays: 1, bytes: 1_000, label: "recent")
+            let r1 = cleanup(retentionDays: 14, maxTotalBytes: 0, now: now, baseDirectory: baseA)
+            let s1 = !fm.fileExists(atPath: old.root.path) && fm.fileExists(atPath: recent.root.path) && r1.removed == 1
+
+            // 场景二:按容量上限从最旧删 —— 三个各 100KB 共 300KB,上限 250KB,删最旧 a 后剩 200KB 达标
+            let baseB = root.appendingPathComponent("by-size", isDirectory: true)
+            let a = try makeTask(in: baseB, ageDays: 3, bytes: 100_000, label: "a")
+            let b = try makeTask(in: baseB, ageDays: 2, bytes: 100_000, label: "b")
+            let c = try makeTask(in: baseB, ageDays: 1, bytes: 100_000, label: "c")
+            let r2 = cleanup(retentionDays: 0, maxTotalBytes: 250_000, now: now, baseDirectory: baseB)
+            let s2 = !fm.fileExists(atPath: a.root.path) && fm.fileExists(atPath: b.root.path)
+                && fm.fileExists(atPath: c.root.path) && r2.removed == 1
+            // 场景四并入此处核对:a 删除后其日期空壳目录应被回收(base 自身保留)
+            let s4 = !fm.fileExists(atPath: a.root.deletingLastPathComponent().path)
+                && fm.fileExists(atPath: baseB.path)
+
+            // 场景三:阈值都 ≤0 —— 什么都不删
+            let baseC = root.appendingPathComponent("disabled", isDirectory: true)
+            let keep = try makeTask(in: baseC, ageDays: 99, bytes: 1_000, label: "keep")
+            let r3 = cleanup(retentionDays: 0, maxTotalBytes: 0, now: now, baseDirectory: baseC)
+            let s3 = fm.fileExists(atPath: keep.root.path) && r3.removed == 0
+
+            // 场景五:旧目录迁移 —— 新位置不存在时整目录搬迁,任务原样落到新位置,旧目录搬空后删除
+            let oldB = root.appendingPathComponent("legacy", isDirectory: true)
+            let newB = root.appendingPathComponent("appsupport/remote-files", isDirectory: true)
+            let legacyTask = try makeTask(in: oldB, ageDays: 1, bytes: 1_000, label: "legacy")
+            let relLegacy = legacyTask.root.path.replacingOccurrences(of: oldB.path + "/", with: "")
+            let n1 = migrateLegacyBaseIfNeeded(oldBase: oldB, newBase: newB)
+            let s5 = n1 == 1 && fm.fileExists(atPath: newB.appendingPathComponent(relLegacy).path)
+                && !fm.fileExists(atPath: oldB.path)
+
+            // 场景六:新位置已存在 —— 逐任务合并搬,旧任务进新位置且原有任务不受影响
+            let oldB2 = root.appendingPathComponent("legacy2", isDirectory: true)
+            let newB2 = root.appendingPathComponent("appsupport2/remote-files", isDirectory: true)
+            let existed = try makeTask(in: newB2, ageDays: 1, bytes: 1_000, label: "existed")
+            let toMigrate = try makeTask(in: oldB2, ageDays: 1, bytes: 1_000, label: "tomigrate")
+            let relMig = toMigrate.root.path.replacingOccurrences(of: oldB2.path + "/", with: "")
+            let n2 = migrateLegacyBaseIfNeeded(oldBase: oldB2, newBase: newB2)
+            let s6 = n2 == 1 && fm.fileExists(atPath: newB2.appendingPathComponent(relMig).path)
+                && fm.fileExists(atPath: existed.root.path)
+
+            let ok = s1 && s2 && s3 && s4 && s5 && s6
+            print("远程文件清理/迁移 dryrun:")
+            print("  场景一 按天保留: \(s1 ? "PASS" : "FAIL") (removed=\(r1.removed))")
+            print("  场景二 容量删旧: \(s2 ? "PASS" : "FAIL") (removed=\(r2.removed))")
+            print("  场景三 阈值关闭: \(s3 ? "PASS" : "FAIL") (removed=\(r3.removed))")
+            print("  场景四 空壳回收: \(s4 ? "PASS" : "FAIL")")
+            print("  场景五 整目录迁移: \(s5 ? "PASS" : "FAIL") (moved=\(n1))")
+            print("  场景六 合并迁移: \(s6 ? "PASS" : "FAIL") (moved=\(n2))")
+            print("  结果:\(ok ? "PASS" : "FAIL")")
+            return ok
+        } catch {
+            print("远程文件清理 dryrun:FAIL \(error.localizedDescription)")
+            return false
+        }
     }
 
     static func runSelfTest() -> Bool {
@@ -1368,6 +1627,9 @@ final class TelegramBot {
             sendMessage(chatID: chatID, text: "文件接收失败:无法创建任务目录。")
             return
         }
+
+        // 新建任务后机会式回收历史文件(带 6 小时节流,绝大多数调用直接返回),防 ~/ClaudePetRemoteFiles 永久堆积。
+        RemoteFileTask.maybeCleanup()
 
         var saved: [RemoteFileTask.InputFile] = []
         var failures: [String] = []

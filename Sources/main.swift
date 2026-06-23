@@ -309,6 +309,24 @@ enum Settings {
         get { stringValue(monitorPluginPathKey, default: "").trimmingCharacters(in: .whitespacesAndNewlines) }
         set { UserDefaults.standard.set(newValue, forKey: monitorPluginPathKey) }
     }
+
+    // MARK: 远程文件任务清理 —— 限制 ~/ClaudePetRemoteFiles 占用,防远程上传文件永久堆积吃满磁盘
+    private static let remoteFileRetentionDaysKey = "remoteFileRetentionDays"
+    private static let remoteFileMaxTotalMBKey = "remoteFileMaxTotalMB"
+    static let defaultRemoteFileRetentionDays = 14
+    static let defaultRemoteFileMaxTotalMB = 2048
+
+    /// 远程文件任务保留天数:任务目录最后活动超过该天数即回收。≤0 表示不按天数清理。缺省 14 天。
+    static var remoteFileRetentionDays: Int {
+        get { intValue(remoteFileRetentionDaysKey, default: defaultRemoteFileRetentionDays) }
+        set { UserDefaults.standard.set(newValue, forKey: remoteFileRetentionDaysKey) }
+    }
+
+    /// 远程文件任务总容量上限(MB):超出后从最旧任务起回收到阈值内。≤0 表示不限容量。缺省 2048MB。
+    static var remoteFileMaxTotalMB: Int {
+        get { intValue(remoteFileMaxTotalMBKey, default: defaultRemoteFileMaxTotalMB) }
+        set { UserDefaults.standard.set(newValue, forKey: remoteFileMaxTotalMBKey) }
+    }
 }
 
 /// 桌宠停靠屏幕四角之一(rawValue 存入 UserDefaults 的 petDockCorner)
@@ -3338,6 +3356,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 任务监控:按"挂载监控系统"开关起停内嵌 HTTP 服务(默认关闭,不启动则零开销)。
         TaskMonitor.reload()
 
+        // 远程文件任务:先把旧版 ~/ClaudePetRemoteFiles 迁到 Application Support 新位置,再后台回收超期/超量历史任务(不卡启动)。
+        DispatchQueue.global(qos: .utility).async {
+            RemoteFileTask.migrateLegacyBaseIfNeeded()
+            RemoteFileTask.maybeCleanup(force: true)
+        }
+
         // 首次在新机器上启动:幂等把 cc/cx 命令简写写进 ~/.zshrc(已有则跳过、绝不动主公现有定义),
         // 让"换台电脑装上桌宠"就自带 cc/cx;新开终端或 source ~/.zshrc 后生效。
         let aliasOutcome = ShellAliasInstaller.ensure(dryRun: false)
@@ -3796,6 +3820,12 @@ MainActor.assumeIsolated {
     if arguments.contains("--telegram-file-task-dryrun") {
         // 自测模式:离线验证 Telegram 文件任务目录隔离、文件名清洗、meta 写入和 outbox 扫描,不连网。
         let ok = RemoteFileTask.runSelfTest()
+        exit(ok ? 0 : 2)
+    }
+
+    if arguments.contains("--telegram-file-cleanup-dryrun") {
+        // 自测模式:离线验证远程文件任务清理(按天保留、按容量删最旧、阈值≤0 跳过、空壳回收),用临时目录,不连网、不碰真实文件。
+        let ok = RemoteFileTask.runCleanupSelfTest()
         exit(ok ? 0 : 2)
     }
 
