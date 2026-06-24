@@ -2379,7 +2379,7 @@ final class PetView: NSView {
     — 全局快捷键(任何应用里都生效) —
       ⌥⌘C   Finder 选中的文件/目录 → 喂给 Claude 分析
       ⌥⌘X   Finder 选中的文件/目录 → 喂给 Codex 分析
-      ⌥⌘V   剪贴板里的文字 → 喂给 Claude
+      ⌥⌘B   剪贴板里的文字 → 喂给 Claude
       ⌥⌘T   翻译选中的文字(中↔英),头顶气泡显示
 
     — 投喂(只读,绝不删改文件) —
@@ -2521,7 +2521,7 @@ final class PetView: NSView {
         runFeedScript(feedScript(for: url, tool: tool))
     }
 
-    /// 投喂一段文字(非文件):在主公家目录起会话,prompt 即这段文字。给"双击问一句""⌥⌘V 喂剪贴板"用。
+    /// 投喂一段文字(非文件):在主公家目录起会话,prompt 即这段文字。给"双击问一句""⌥⌘B 喂剪贴板"用。
     /// 复用同一套脚本与 cc/cx 候选,跳过权限确认;只读文本,绝不碰任何文件。
     static func analyzeText(_ text: String, with tool: FeedTool) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2743,11 +2743,11 @@ enum GlobalHotKey {
         }
     }
 
-    /// ⌥⌘V:把剪贴板里的文字喂给 tool。直接读 NSPasteboard(不模拟按键),无需辅助功能权限;
+    /// ⌥⌘B:把剪贴板里的文字喂给 tool。直接读 NSPasteboard(不模拟按键),无需辅助功能权限;
     /// 有视图则扑到鼠标处嚼一口再开会话,与 Finder 投喂观感一致。
     static func feedClipboard(into petView: PetView?, with tool: FeedTool) {
         let text = NSPasteboard.general.string(forType: .string) ?? ""
-        PetView.log("热键触发 ⌥⌘V → \(tool.label) 剪贴板 \(text.count) 字")
+        PetView.log("热键触发 ⌥⌘B → \(tool.label) 剪贴板 \(text.count) 字")
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { NSSound.beep(); return }
         if let petView {
             petView.pounceToMouseAndEat { PetView.analyzeText(text, with: tool) }
@@ -3337,11 +3337,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let okTranslate = GlobalHotKey.register(keyCode: UInt32(kVK_ANSI_T), modifiers: mods) { [weak petView] in
             petView?.translateSelection()
         }
-        // ⌥⌘V:把剪贴板里的文字喂给 claude(扑到鼠标处嚼一口再开会话),不模拟按键、无需辅助功能权限
-        let okPaste = GlobalHotKey.register(keyCode: UInt32(kVK_ANSI_V), modifiers: mods) { [weak petView] in
+        // ⌥⌘B:把剪贴板里的文字喂给 claude(扑到鼠标处嚼一口再开会话),不模拟按键、无需辅助功能权限
+        let okPaste = GlobalHotKey.register(keyCode: UInt32(kVK_ANSI_B), modifiers: mods) { [weak petView] in
             GlobalHotKey.feedClipboard(into: petView, with: .claude)
         }
-        PetView.log("热键注册 ⌥⌘C(claude)=\(okClaude) ⌥⌘X(codex)=\(okCodex) ⌥⌘T(translate)=\(okTranslate) ⌥⌘V(paste)=\(okPaste)")
+        PetView.log("热键注册 ⌥⌘C(claude)=\(okClaude) ⌥⌘X(codex)=\(okCodex) ⌥⌘T(translate)=\(okTranslate) ⌥⌘B(paste)=\(okPaste)")
 
         // 设置里改停靠角 → 即时把窗口挪到新角
         NotificationCenter.default.addObserver(self, selector: #selector(handleDockCornerDidChange(_:)), name: .dockCornerDidChange, object: nil)

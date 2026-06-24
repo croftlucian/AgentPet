@@ -72,7 +72,7 @@ BIN=./ClaudePet.app/Contents/MacOS/ClaudePet
 - **设置窗口是手写 AppKit 布局**：`SettingsWindowController` 维护权限、划词翻译、互动、陪跑、作息脾气、通知、窗口七组控件。改设置项时要同步 `buildContent(...)`、对应 action、回填方法和必要通知。新增组靠顶部加高窗口(`content` 高度)腾出空间、不挪动既有控件 y 坐标。
 - **权限组只读状态 + 跳转**：app 无法给自己授权,「权限」组只显示完全磁盘访问(探测 `~/Library/Application Support/com.apple.TCC/TCC.db` 是否可读,见 `PetView.hasFullDiskAccess`)、辅助功能(`AXIsProcessTrusted`)的状态,并用 `x-apple.systempreferences:...?Privacy_AllFiles|Privacy_Accessibility` 一键跳到系统设置;`windowDidBecomeKey` 在切回窗口时重新探测刷新。完全磁盘访问是远程遥控 cc/cx 进受保护目录的关键(子进程继承桌宠的 TCC 授权)。
 - **IM 未读只看提示面**：`imTargets` 泛化微信/飞书，默认关闭；轮询 Dock 辅助功能树和窗口标题，判断是否有未读和粗略数量，不读取数据库和消息正文。
-- **投喂入口归一**：拖放、`⌥⌘C`、`⌥⌘X`、`⌥⌘V`、双击/菜单输入最终都进入 `PetView.analyze(...)` 或 `PetView.analyzeText(...)`，由 `FeedTool` 决定 Claude / Codex 命令候选和 prompt 文案。
+- **投喂入口归一**：拖放、`⌥⌘C`、`⌥⌘X`、`⌥⌘B`、双击/菜单输入最终都进入 `PetView.analyze(...)` 或 `PetView.analyzeText(...)`，由 `FeedTool` 决定 Claude / Codex 命令候选和 prompt 文案。
 - **cc/cx 随桌宠落地用户 shell**：`ShellAliasInstaller.ensure(...)` 在 `applicationDidFinishLaunching` 末尾幂等把 `cc`/`cx` alias 写进 `~/.zshrc`，让“换台电脑装上桌宠”就自带 `cc`/`cx`、无需手动配；首次写入经 `PetView.flashInfo` 闪横幅告知（本机已配则零改动、不弹）。**只做 alias、绝不装成 PATH 可执行**：`cc` 是系统 C 编译器（`/usr/bin/cc`）的标准名，做成可执行文件丢进 PATH 靠前目录会遮蔽它、令 `make`/`./configure`/原生编译错走到 `claude`；alias 只在交互式 shell 顶层展开，不污染脚本与编译。判定按整行去空白后 `alias <名>=` 前缀、注释行不算，**已有定义一律跳过、绝不覆盖主公现有别名**。离线自测：`--install-aliases-selftest`（临时文件跑真写入）、`--install-aliases-dryrun`（只读真实 `~/.zshrc`）。
 - **全局热键中心化分发**：`GlobalHotKey` 只安装一个 Carbon application handler，用 keyCode 作为 hotKeyID 查表分发。不要给每个热键各装一个 handler，否则事件链可能被先返回 `noErr` 的处理器吃掉。
 - **通知协议入口在 AppDelegate**：`AppDelegate.application(_:open:)` 接收 `claudepet://start|waiting|done?...`，`handleClaudePetURL(_:)` 解析 `tool`、`sid`、`cwd`、`task`，节流只抑制横幅，不抑制会话状态和角标更新。
@@ -90,7 +90,7 @@ BIN=./ClaudePet.app/Contents/MacOS/ClaudePet
 | 拖文件/目录到桌宠 | 喂给 Claude |
 | `⌥⌘C` | Finder 当前选中项喂给 Claude |
 | `⌥⌘X` | Finder 当前选中项喂给 Codex |
-| `⌥⌘V` | 剪贴板文本喂给 Claude |
+| `⌥⌘B` | 剪贴板文本喂给 Claude |
 | `⌥⌘T` | 翻译当前选中文字，结果显示在横幅 |
 | 单击身体 | 嚼一口 |
 | 双击身体 | 弹输入框，默认问 Claude |
