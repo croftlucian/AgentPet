@@ -4,7 +4,7 @@
 
 ## 项目定位
 
-macOS 桌面宠物：在屏幕角落浮一个手绘的 Claude 星芒，安静呼吸；支持拖文件、全局快捷键、剪贴板、双击输入，把内容投喂给 Claude / Codex；同时陪跑 Claude Code / Codex 生命周期、提示微信/飞书未读、划词翻译和作息提醒；还能经 Telegram / 飞书远程遥控 cc/cx，并把远程每轮任务落盘成 JSONL、起本地仪表盘监控。核心运行逻辑在 `Sources/main.swift`（约 3836 行，AppKit），另有三个独立模块：`Sources/RemoteControl.swift`（Telegram 远程遥控，约 834 行）、`Sources/FeishuRemote.swift`（飞书长连接远程遥控，约 766 行）、`Sources/TaskMonitor.swift`（任务监控落盘 + 本地 HTTP 仪表盘，约 417 行），四文件由 `build.sh` 一起 `swiftc` 编进同一二进制。无 Xcode 工程、无 SwiftPM，构建完全由 `build.sh` 驱动。
+macOS 桌面宠物：在屏幕角落浮一个手绘的 Claude 星芒，安静呼吸；支持拖文件、全局快捷键、剪贴板、双击输入，把内容投喂给 Claude / Codex；同时陪跑 Claude Code / Codex 生命周期、提示微信/飞书未读、划词翻译和作息提醒；还能经 Telegram / 飞书远程遥控 cc/cx，并把远程每轮任务落盘成 JSONL、起本地仪表盘监控。核心运行逻辑在 `Sources/main.swift`（约 3960 行，AppKit），另有三个独立模块：`Sources/RemoteControl.swift`（Telegram 远程遥控 + 远程 Bot 个性化设置/公告 + 文件任务隔离清理，约 2550 行）、`Sources/FeishuRemote.swift`（飞书长连接远程遥控，约 780 行）、`Sources/TaskMonitor.swift`（任务监控落盘 + 本地 HTTP 仪表盘，约 420 行），四文件由 `build.sh` 一起 `swiftc` 编进同一二进制。无 Xcode 工程、无 SwiftPM，构建完全由 `build.sh` 驱动。
 
 ## 构建与运行
 
