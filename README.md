@@ -224,7 +224,7 @@ BIN=./ClaudePet.app/Contents/MacOS/ClaudePet
 "$BIN" --telegram-dryrun <claude|codex> <文本> # 远程遥控:离线打印将执行的 cc/cx 命令(首轮+续接),不连网
 "$BIN" --telegram-stream-dryrun <claude|codex>  # 远程遥控:离线喂样本核对流式进度提取(进度行/最终正文/会话 id),不连网
 "$BIN" --telegram-file-task-dryrun             # 远程遥控:离线核对 Telegram 文件任务目录隔离/meta/outbox
-"$BIN" --telegram-file-cleanup-dryrun          # 远程遥控:离线核对文件任务清理(按天保留/容量删最旧/空壳回收),不碰真实文件
+"$BIN" --telegram-file-cleanup-dryrun          # 远程遥控:离线核对文件任务清理(按天保留/容量删最旧/空壳回收)+ 目录迁移/日期分桶拍平/meta 洗白,不碰真实文件
 "$BIN" --telegram-live-test <claude|codex> <文本> # 远程遥控:真跑一轮打印实时进度(会真调 CLI、耗额度)
 "$BIN" --feishu-pb-test                          # 远程遥控(飞书):长连接 protobuf 帧编解码往返自测,不连网
 "$BIN" --feishu-event-dryrun                     # 远程遥控(飞书):样本事件解析自测(私聊/群@/非文字),不连网

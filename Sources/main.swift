@@ -3356,9 +3356,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 任务监控:按"挂载监控系统"开关起停内嵌 HTTP 服务(默认关闭,不启动则零开销)。
         TaskMonitor.reload()
 
-        // 远程文件任务:先把旧版 ~/ClaudePetRemoteFiles 迁到 Application Support 新位置,再后台回收超期/超量历史任务(不卡启动)。
+        // 远程文件任务:先把旧版 ~/ClaudePetRemoteFiles 迁到 Application Support 新位置、再把按日期分桶的历史任务拍平并洗 meta,最后后台回收超期/超量历史任务(不卡启动)。
         DispatchQueue.global(qos: .utility).async {
             RemoteFileTask.migrateLegacyBaseIfNeeded()
+            RemoteFileTask.migrateFlattenDateBucketsIfNeeded()
             RemoteFileTask.maybeCleanup(force: true)
         }
 

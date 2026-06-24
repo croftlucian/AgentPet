@@ -931,25 +931,88 @@ struct RemoteFileTask {
         return moved
     }
 
+    /// 把旧的「按 年/月/日 分桶」历史任务(平台/bot/用户/yyyy/MM/dd/任务)拍平成 平台/bot/用户/任务,
+    /// 并洗掉 meta 里残留的绝对路径。幂等:已扁平的只洗一次 meta、不挪动。返回处理过的任务数。
+    /// 判定:任务相对 base >4 段即夹着日期壳,拍平到 前3段 + taskID(末段)。默认走真实 base,自测传临时 base。
+    @discardableResult
+    static func migrateFlattenDateBucketsIfNeeded(base: URL? = nil) -> Int {
+        let fm = FileManager.default
+        let base = base ?? defaultBaseDirectory()
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: base.path, isDirectory: &isDir), isDir.boolValue,
+              let enumerator = fm.enumerator(at: base, includingPropertiesForKeys: nil) else { return 0 }
+        var taskRoots: [URL] = []
+        for case let url as URL in enumerator where url.lastPathComponent == "meta.json" {
+            taskRoots.append(url.deletingLastPathComponent())
+        }
+        // 两端统一 resolvingSymlinksInPath 再剥前缀,避免 /var↔/private/var 错位(同 migrateLegacyBaseIfNeeded 的坑)。
+        let baseComponents = base.resolvingSymlinksInPath().pathComponents
+        var processed = 0
+        for taskRoot in taskRoots {
+            let rel = Array(taskRoot.resolvingSymlinksInPath().pathComponents.dropFirst(baseComponents.count))
+            guard rel.count >= 4 else { continue }   // 不足 平台/bot/用户/任务 4 段,非正常任务,跳过
+            let moved = rel.count > 4
+            var finalRoot = taskRoot
+            if moved {
+                // 扁平目标:平台/bot/用户(前 3 段)+ 任务(末段),中间的 年/月/日 壳全丢。
+                let flat = [rel[0], rel[1], rel[2], rel[rel.count - 1]]
+                var dest = flat.reduce(base) { $0.appendingPathComponent($1, isDirectory: true) }
+                if fm.fileExists(atPath: dest.path) {   // 极罕见撞名:加 uuid 后缀,绝不覆盖
+                    dest = dest.deletingLastPathComponent()
+                        .appendingPathComponent(dest.lastPathComponent + "-" + String(UUID().uuidString.prefix(4)), isDirectory: true)
+                }
+                do {
+                    try fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try fm.moveItem(at: taskRoot, to: dest)
+                    finalRoot = dest
+                } catch {
+                    PetView.log("远程文件扁平化失败(任务 \(taskRoot.lastPathComponent)):\(error.localizedDescription)")
+                    continue
+                }
+            }
+            let metaCleaned = stripLegacyPathsFromMeta(finalRoot.appendingPathComponent("meta.json"))
+            if moved || metaCleaned { processed += 1 }
+        }
+        pruneEmptyDirectories(base)
+        if processed > 0 { PetView.log("远程文件目录扁平化:处理 \(processed) 个历史任务(去日期壳 / 洗 meta 旧路径)") }
+        return processed
+    }
+
+    /// 删掉 meta.json 里冗余的绝对路径字段(root/inbox/work/outbox 及每个 file 的 path)。
+    /// 新版 writeMeta 已不写这些,这里负责把存量旧 meta 洗干净。返回是否实际改动过(无冗余则不重写)。
+    @discardableResult
+    static func stripLegacyPathsFromMeta(_ metaURL: URL) -> Bool {
+        guard let data = try? Data(contentsOf: metaURL),
+              var obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return false }
+        var changed = false
+        for key in ["root", "inbox", "work", "outbox"] where obj[key] != nil {
+            obj.removeValue(forKey: key); changed = true
+        }
+        if var files = obj["files"] as? [[String: Any]] {
+            var fileChanged = false
+            for i in files.indices where files[i]["path"] != nil {
+                files[i].removeValue(forKey: "path"); fileChanged = true
+            }
+            if fileChanged { obj["files"] = files; changed = true }
+        }
+        guard changed,
+              let out = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys]) else { return changed }
+        try? out.write(to: metaURL, options: .atomic)
+        return true
+    }
+
     static func create(platform: String, botID: String, remoteUserID: String, now: Date = Date(),
                        baseDirectory: URL? = nil) throws -> RemoteFileTask {
         let safePlatform = sanitizePathSegment(platform, fallback: "platform")
         let safeBot = sanitizePathSegment(botID, fallback: "bot")
         let safeUser = sanitizePathSegment(remoteUserID, fallback: "user")
-        let cal = Calendar(identifier: .gregorian)
-        let parts = cal.dateComponents([.year, .month, .day], from: now)
-        let yyyy = String(format: "%04d", parts.year ?? 1970)
-        let mm = String(format: "%02d", parts.month ?? 1)
-        let dd = String(format: "%02d", parts.day ?? 1)
+        // 任务目录直挂 平台/bot/用户/任务,不再按 年/月/日 分桶:taskID 自带 yyyyMMdd-HHmmss、日期信息不丢,省掉三层冗余深度与空壳。
         let taskID = makeTaskID(date: now)
         let base = baseDirectory ?? defaultBaseDirectory()
         let root = base
             .appendingPathComponent(safePlatform, isDirectory: true)
             .appendingPathComponent(safeBot, isDirectory: true)
             .appendingPathComponent(safeUser, isDirectory: true)
-            .appendingPathComponent(yyyy, isDirectory: true)
-            .appendingPathComponent(mm, isDirectory: true)
-            .appendingPathComponent(dd, isDirectory: true)
             .appendingPathComponent(taskID, isDirectory: true)
         let inbox = root.appendingPathComponent("inbox", isDirectory: true)
         let work = root.appendingPathComponent("work", isDirectory: true)
@@ -1039,13 +1102,15 @@ struct RemoteFileTask {
     func writeMeta(chatID: String, senderName: String, toolLabel: String, requestText: String,
                    files: [InputFile]) throws {
         let iso = ISO8601DateFormatter()
+        // meta 只记逻辑元数据,不落 root/inbox/work/outbox/file.path 等绝对路径:这些全可由任务目录推导
+        // (root = meta 所在目录,inbox/work/outbox 是固定子目录,文件即 inbox/<storedName>),
+        // 落了反成搬目录后唯一会失准的字段。storedName 即 inbox 内文件名,足够定位。
         let filePayload: [[String: Any]] = files.map { f in
             var item: [String: Any] = [
                 "sourceKind": f.sourceKind,
                 "fileID": f.fileID,
                 "originalName": f.originalName,
                 "storedName": f.storedName,
-                "path": f.path,
             ]
             if let size = f.size { item["size"] = size }
             if let mimeType = f.mimeType { item["mimeType"] = mimeType }
@@ -1060,10 +1125,6 @@ struct RemoteFileTask {
             "tool": toolLabel,
             "taskID": taskID,
             "createdAt": iso.string(from: createdAt),
-            "root": root.path,
-            "inbox": inbox.path,
-            "work": work.path,
-            "outbox": outbox.path,
             "requestText": requestText,
             "files": filePayload,
         ]
@@ -1284,9 +1345,14 @@ struct RemoteFileTask {
             let r2 = cleanup(retentionDays: 0, maxTotalBytes: 250_000, now: now, baseDirectory: baseB)
             let s2 = !fm.fileExists(atPath: a.root.path) && fm.fileExists(atPath: b.root.path)
                 && fm.fileExists(atPath: c.root.path) && r2.removed == 1
-            // 场景四并入此处核对:a 删除后其日期空壳目录应被回收(base 自身保留)
-            let s4 = !fm.fileExists(atPath: a.root.deletingLastPathComponent().path)
-                && fm.fileExists(atPath: baseB.path)
+            // 场景四:空壳回收 —— 扁平结构下单任务删除后,其上层 平台/bot/用户 空壳应被清掉、base 自身保留。
+            // (不能复用场景二的 a:扁平后 a/b/c 共享同一个用户目录,删 a 后父目录仍有 b/c、本就不该回收。)
+            let baseE = root.appendingPathComponent("prune", isDirectory: true)
+            let solo = try makeTask(in: baseE, ageDays: 1, bytes: 1_000, label: "solo")
+            try fm.removeItem(at: solo.root)            // 模拟任务被清,只剩空的 平台/bot/用户 壳
+            pruneEmptyDirectories(baseE)
+            let s4 = !fm.fileExists(atPath: solo.root.deletingLastPathComponent().path)   // 用户壳已回收
+                && fm.fileExists(atPath: baseE.path)                                       // base 自身保留
 
             // 场景三:阈值都 ≤0 —— 什么都不删
             let baseC = root.appendingPathComponent("disabled", isDirectory: true)
@@ -1313,7 +1379,28 @@ struct RemoteFileTask {
             let s6 = n2 == 1 && fm.fileExists(atPath: newB2.appendingPathComponent(relMig).path)
                 && fm.fileExists(atPath: existed.root.path)
 
-            let ok = s1 && s2 && s3 && s4 && s5 && s6
+            // 场景七:日期分桶拍平 —— 手造 平台/bot/用户/yyyy/MM/dd/任务 旧结构 + meta 残留绝对路径,
+            // 扁平化后应搬到 平台/bot/用户/任务、日期空壳被回收、meta 里 root/inbox/work/outbox/file.path 全洗掉、逻辑字段保留。
+            let baseD = root.appendingPathComponent("flatten/remote-files", isDirectory: true)
+            let dated = baseD.appendingPathComponent("telegram/cc-bot1/u1/2026/06/22/20260622-101010-aaaa", isDirectory: true)
+            try fm.createDirectory(at: dated.appendingPathComponent("inbox", isDirectory: true), withIntermediateDirectories: true)
+            try fm.createDirectory(at: dated.appendingPathComponent("outbox", isDirectory: true), withIntermediateDirectories: true)
+            try Data("x".utf8).write(to: dated.appendingPathComponent("inbox/a.txt"))
+            let legacyMeta: [String: Any] = ["taskID": "20260622-101010-aaaa", "platform": "telegram",
+                "root": "/old/abs", "inbox": "/old/abs/inbox", "work": "/old/abs/work", "outbox": "/old/abs/outbox",
+                "files": [["storedName": "a.txt", "path": "/old/abs/inbox/a.txt"]]]
+            try JSONSerialization.data(withJSONObject: legacyMeta, options: [.prettyPrinted])
+                .write(to: dated.appendingPathComponent("meta.json"))
+            let n3 = migrateFlattenDateBucketsIfNeeded(base: baseD)
+            let flatRoot = baseD.appendingPathComponent("telegram/cc-bot1/u1/20260622-101010-aaaa", isDirectory: true)
+            let metaAfter = (try? String(contentsOf: flatRoot.appendingPathComponent("meta.json"), encoding: .utf8)) ?? ""
+            let s7 = n3 == 1
+                && fm.fileExists(atPath: flatRoot.appendingPathComponent("inbox/a.txt").path)
+                && !fm.fileExists(atPath: baseD.appendingPathComponent("telegram/cc-bot1/u1/2026").path)
+                && !metaAfter.contains("/old/abs") && !metaAfter.contains("\"root\"") && !metaAfter.contains("\"inbox\"")
+                && metaAfter.contains("\"taskID\"")
+
+            let ok = s1 && s2 && s3 && s4 && s5 && s6 && s7
             print("远程文件清理/迁移 dryrun:")
             print("  场景一 按天保留: \(s1 ? "PASS" : "FAIL") (removed=\(r1.removed))")
             print("  场景二 容量删旧: \(s2 ? "PASS" : "FAIL") (removed=\(r2.removed))")
@@ -1321,6 +1408,7 @@ struct RemoteFileTask {
             print("  场景四 空壳回收: \(s4 ? "PASS" : "FAIL")")
             print("  场景五 整目录迁移: \(s5 ? "PASS" : "FAIL") (moved=\(n1))")
             print("  场景六 合并迁移: \(s6 ? "PASS" : "FAIL") (moved=\(n2))")
+            print("  场景七 日期拍平: \(s7 ? "PASS" : "FAIL") (processed=\(n3))")
             print("  结果:\(ok ? "PASS" : "FAIL")")
             return ok
         } catch {
@@ -1353,7 +1441,9 @@ struct RemoteFileTask {
             let outbox = task.outboxFiles().map(\.lastPathComponent)
             let followUp = task.followUpPrompt(userRequest: "把刚才那个文件再整理一下")
             let latest = latestExisting(platform: "telegram", botID: "cx-bot2", remoteUserID: "8231781034", baseDirectory: base)
-            let ok = task.root.path.contains("/telegram/cx-bot2/8231781034/")
+            let ok = task.root.deletingLastPathComponent().lastPathComponent == "8231781034"   // 扁平:任务直挂用户目录,中间无 年/月/日 壳
+                && task.root.path.contains("/telegram/cx-bot2/8231781034/")
+                && !metaText.contains("\"root\"") && !metaText.contains("\"inbox\"")   // meta 不再落绝对路径字段
                 && task.inbox.lastPathComponent == "inbox"
                 && task.work.lastPathComponent == "work"
                 && task.outbox.lastPathComponent == "outbox"
