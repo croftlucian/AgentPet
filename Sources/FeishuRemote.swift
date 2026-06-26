@@ -352,7 +352,7 @@ final class FeishuLongConn: NSObject, URLSessionWebSocketDelegate {
         self.appSecret = appSecret
         self.logTag = logTag
         self.onEvent = onEvent
-        self.connQueue = DispatchQueue(label: "claudepet.feishu.conn.\(logTag)")
+        self.connQueue = DispatchQueue(label: "agentpet.feishu.conn.\(logTag)")
         super.init()
     }
 
@@ -633,7 +633,7 @@ final class FeishuBot {
         let key = inc.chatType == "p2p" ? "u:" + inc.senderOpenID : "c:" + inc.chatID + ":u:" + inc.senderOpenID
         if let ctx = contexts[key] { return ctx }
         let tag = tool == .codex ? "cx" : "cc"
-        let ctx = ChatContext(tool: tool, cwd: home, label: "claudepet.feishu.\(tag).\(key)")
+        let ctx = ChatContext(tool: tool, cwd: home, label: "agentpet.feishu.\(tag).\(key)")
         contexts[key] = ctx
         return ctx
     }

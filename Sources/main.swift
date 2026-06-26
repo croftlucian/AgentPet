@@ -97,7 +97,7 @@ enum Settings {
         }
     }
 
-    /// 任务完成提示开关(Claude/Codex 报喜),缺省开启——这是主动配了 hook 才会用到的功能。
+    /// 任务完成提示开关(cc/Codex 报喜),缺省开启——这是主动配了 hook 才会用到的功能。
     private static let receiveTaskDoneNotificationsKey = "receiveTaskDoneNotifications"
     static var receiveTaskDoneNotifications: Bool {
         get {
@@ -304,13 +304,13 @@ enum Settings {
         set { UserDefaults.standard.set(min(max(newValue, 1024), 65535), forKey: monitorPortKey) }
     }
 
-    /// 前端 dist 目录覆盖路径;留空则自动定位兄弟项目 claude-pet-monitor/dist,再缺则走内置回退页。
+    /// 前端 dist 目录覆盖路径;留空则自动定位兄弟项目 agent-pet-monitor/dist,再缺则走内置回退页。
     static var monitorPluginPath: String {
         get { stringValue(monitorPluginPathKey, default: "").trimmingCharacters(in: .whitespacesAndNewlines) }
         set { UserDefaults.standard.set(newValue, forKey: monitorPluginPathKey) }
     }
 
-    // MARK: 远程文件任务清理 —— 限制 ~/ClaudePetRemoteFiles 占用,防远程上传文件永久堆积吃满磁盘
+    // MARK: 远程文件任务清理 —— 限制 ~/AgentPetRemoteFiles 占用,防远程上传文件永久堆积吃满磁盘
     private static let remoteFileRetentionDaysKey = "remoteFileRetentionDays"
     private static let remoteFileMaxTotalMBKey = "remoteFileMaxTotalMB"
     static let defaultRemoteFileRetentionDays = 14
@@ -351,11 +351,11 @@ private enum DockCorner: Int, CaseIterable {
 }
 
 private extension Notification.Name {
-    static let petColorDidChange = Notification.Name("ClaudePet.petColorDidChange")
-    static let autoAdaptColorDidChange = Notification.Name("ClaudePet.autoAdaptColorDidChange")
-    static let weChatNotificationsDidChange = Notification.Name("ClaudePet.weChatNotificationsDidChange")
-    static let dockCornerDidChange = Notification.Name("ClaudePet.dockCornerDidChange")
-    static let petBehaviorDidChange = Notification.Name("ClaudePet.petBehaviorDidChange")
+    static let petColorDidChange = Notification.Name("AgentPet.petColorDidChange")
+    static let autoAdaptColorDidChange = Notification.Name("AgentPet.autoAdaptColorDidChange")
+    static let weChatNotificationsDidChange = Notification.Name("AgentPet.weChatNotificationsDidChange")
+    static let dockCornerDidChange = Notification.Name("AgentPet.dockCornerDidChange")
+    static let petBehaviorDidChange = Notification.Name("AgentPet.petBehaviorDidChange")
 }
 
 private extension NSColor {
@@ -369,7 +369,7 @@ private extension NSColor {
 }
 
 // MARK: - 宠物视图
-// 按终端象限网格自绘 Claude 星芒(还原 Claude Code 欢迎界面的方块星芒),
+// 按终端象限网格自绘 星芒(还原 Claude Code 欢迎界面的方块星芒),
 // 交给 Core Animation 做安静的“呼吸”缩放;draw(_:) 仅供离屏快照,运行时由图层显示。
 final class PetView: NSView {
     /// 离屏快照底色档:深色档模拟深桌面、浅色档模拟亮桌面,用于核对描边轮廓在两种背景下的可见性
@@ -432,7 +432,7 @@ final class PetView: NSView {
     /// 单个陪跑会话状态:最近事件时间(供超时兜底)、是否在等主公(waiting 置位,驱动角标"等N")、承载会话的进程 pid(供 kill -0 探活)。
     struct SessionInfo { var at: Date; var waiting: Bool; var pid: pid_t? = nil }
     /// 每个 sid 已处理事件的最新"生成时间戳"(epoch 秒,由 hook 注入 ts 参数)。
-    /// hook 每个事件都是 `open claudepet://` 一发即走,LaunchServices 不保证按发出顺序投递;sid 又在整段对话里复用——
+    /// hook 每个事件都是 `open agentpet://` 一发即走,LaunchServices 不保证按发出顺序投递;sid 又在整段对话里复用——
     /// 上一轮迟到的 done 会误删刚开跑的新轮(「跑」丢)、上一轮迟到的尾随 waiting 会把新轮误标「等」(「等」错)。
     /// 据此按 ts 定序:同一 sid 收到比已处理更旧的事件一律丢弃,一并治住「跑」「等」两类错标,无需任何时间宽限窗猜测。
     private var lastEventAt: [String: Double] = [:]
@@ -465,12 +465,15 @@ final class PetView: NSView {
     /// 眼形三态:统一驱动眨眼(closed)、哈欠闭眼(closed)、眯眼笑(happy)。normal 时才随鼠标偏移。
     enum EyeMode { case normal, closed, happy }
 
-    /// Claude 星芒的方块拼图(取自 Claude Code 欢迎界面),逐字符按象限自绘,严丝合缝
+    /// 星芒的方块拼图(取自 Claude Code 欢迎界面),逐字符按象限自绘,严丝合缝
     private static let starArt = [
         " ▐▛███▜▌",
         "▝▜█████▛▘",
         "  ▘▘ ▝▝",
     ]
+    /// 临时桌宠皮肤:先加载主公选中的高清像素 PNG 试效果;资源缺失时自动回退到代码绘制星芒。
+    private static let petSkin = Bundle.main.url(forResource: "agent-pet-skin", withExtension: "png")
+        .flatMap { NSImage(contentsOf: $0) }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -797,7 +800,7 @@ final class PetView: NSView {
                 lastWeChatPermissionHintAt = Date()
                 showWeChatNotificationHint(message: "请开启辅助功能", duration: 8.0)
             }
-            logWeChatAccessibilityFailure("接收 IM 通知需要在系统设置里允许 ClaudePet 使用辅助功能")
+            logWeChatAccessibilityFailure("接收 IM 通知需要在系统设置里允许 AgentPet 使用辅助功能")
             return
         }
         weChatAccessibilityFailureLogged = false
@@ -1143,7 +1146,7 @@ final class PetView: NSView {
     }
 
     // MARK: 微信探测诊断(临时取证)
-    // 把 Dock 与微信辅助功能树里所有"有信息量"的字段(含专放角标的 AXStatusLabel)dump 到 /tmp/claudepet.log,
+    // 把 Dock 与微信辅助功能树里所有"有信息量"的字段(含专放角标的 AXStatusLabel)dump 到 /tmp/agentpet.log,
     // 据真实字样对症修探测规则。临时手段:定准规则后连同 --wechat-dump 与菜单项一并移除。
     fileprivate static func dumpWeChatAccessibilityTree() {
         log("==== 微信探测诊断开始 ====")
@@ -1346,7 +1349,7 @@ final class PetView: NSView {
     }
 
     // MARK: 点击互动
-    // mouseUp 按落点分流:可点横幅 → 回现场;双击身体 → 弹输入框问 Claude;单击身体 → 吃一口。
+    // mouseUp 按落点分流:可点横幅 → 回现场;双击身体 → 弹输入框问 cc;单击身体 → 吃一口。
     // 仍不 override mouseDown,保留 isMovableByWindowBackground 整窗拖拽。
     override func mouseUp(with event: NSEvent) {
         let pt = convert(event.locationInWindow, from: nil)
@@ -1509,11 +1512,11 @@ final class PetView: NSView {
         return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
-    /// 双击桌宠 / 右键"问 Claude·Codex" → 弹多行输入框,把主公打的字或贴的报错喂去开会话(在家目录)。
+    /// 双击桌宠 / 右键"问 cc·Codex" → 弹多行输入框,把主公打的字或贴的报错喂去开会话(在家目录)。
     /// 复用投喂同一套脚本与 cc/cx 候选;只读输入文本,不碰任何文件。
     func promptAndFeed(tool: FeedTool) {
         NSApp.activate(ignoringOtherApps: true)            // 附件应用须先激活,弹框才抢得到键盘焦点
-        let who = (tool == .codex) ? "Codex" : "Claude"
+        let who = (tool == .codex) ? "Codex" : "cc"
         let alert = NSAlert()
         alert.messageText = "喂给 \(who) 一句话"
         alert.informativeText = "打一句话,或贴一段报错——小的叼去在家目录开个会话。"
@@ -1660,12 +1663,12 @@ final class PetView: NSView {
         actions.randomElement()?()
     }
 
-    // MARK: 陪跑指示灯(随 Claude/Codex 生命周期事件:开工进专注、等确认提醒、收工庆祝)
+    // MARK: 陪跑指示灯(随 cc/Codex 生命周期事件:开工进专注、等确认提醒、收工庆祝)
     // 多终端并发按 sid 聚合:任意会话在跑就保持专注,全部收工才歇;某会话崩了没发 done 由超时清理兜底。
     private static let runningAccent = NSColor(srgbRed: 0.20, green: 0.78, blue: 0.35, alpha: 0.95) // 系统绿,正在干活
     private static let waitingAccent = NSColor(srgbRed: 0.96, green: 0.65, blue: 0.14, alpha: 0.95) // 琥珀黄,醒目催点头
 
-    /// 陪跑事件入口(由 AppDelegate 解析 claudepet:// 后调用)。phase ∈ start|waiting|done;cwd 供横幅"点回现场",tty 供精确回窗口,ts 供乱序定序。
+    /// 陪跑事件入口(由 AppDelegate 解析 agentpet:// 后调用)。phase ∈ start|waiting|done;cwd 供横幅"点回现场",tty 供精确回窗口,ts 供乱序定序。
     func handleCompanionEvent(phase: String, sid: String, message: String, cwd: String?, tty: String?, ts: Double?, pid: pid_t?, suppressBanner: Bool) {
         // 事件按"生成时间戳"定序,免疫 LaunchServices 的乱序投递:同一 sid 收到比已处理更旧的事件即丢弃,
         // 旧轮迟到的 done/waiting 不再污染新轮(老 hook 不带 ts 时退化为不去重,功能不哑火)。
@@ -2077,10 +2080,10 @@ final class PetView: NSView {
         CATransaction.commit()
     }
 
-    /// 诊断日志(临时):追加写入 /tmp/claudepet.log,核对拖放/动画各环节是否触发
+    /// 诊断日志(临时):追加写入 /tmp/agentpet.log,核对拖放/动画各环节是否触发
     static func log(_ message: String) {
         let line = message + "\n"
-        let url = URL(fileURLWithPath: "/tmp/claudepet.log")
+        let url = URL(fileURLWithPath: "/tmp/agentpet.log")
         if let fh = try? FileHandle(forWritingTo: url) {
             defer { try? fh.close() }
             fh.seekToEndOfFile()
@@ -2117,6 +2120,13 @@ final class PetView: NSView {
         image.lockFocus()
         defer { image.unlockFocus() }
         guard let ctx = NSGraphicsContext.current?.cgContext else { return image }
+
+        if let petSkin {
+            let fitted = aspectFitRect(imageSize: petSkin.size, in: CGRect(origin: .zero, size: size).insetBy(dx: size.width * 0.05, dy: size.height * 0.05))
+            petSkin.draw(in: fitted, from: .zero, operation: .sourceOver, fraction: 1)
+            drawSkinFace(ctx, in: fitted, mouthOpen: mouthOpen, eyeLook: eyeLook, eyeMode: eyeMode)
+            return image
+        }
 
         let rowCount = starArt.count
         let colCount = starArt.map(\.count).max() ?? 1
@@ -2173,6 +2183,86 @@ final class PetView: NSView {
             ctx.fill(mouthRect)
         }
         return image
+    }
+
+    /// 按比例把 PNG 皮肤塞进桌宠窗口,避免拉伸变形;留一点边距给呼吸动画与外部阴影。
+    private static func aspectFitRect(imageSize: CGSize, in bounds: CGRect) -> CGRect {
+        guard imageSize.width > 0, imageSize.height > 0, bounds.width > 0, bounds.height > 0 else { return bounds }
+        let scale = min(bounds.width / imageSize.width, bounds.height / imageSize.height)
+        let width = imageSize.width * scale
+        let height = imageSize.height * scale
+        return CGRect(x: bounds.midX - width / 2,
+                      y: bounds.midY - height / 2,
+                      width: width,
+                      height: height)
+    }
+
+    /// PNG 皮肤只负责身体轮廓;眼睛、笑眼、闭眼和吃东西的嘴仍由代码重画,保留原桌宠互动。
+    private static func drawSkinFace(_ ctx: CGContext, in rect: CGRect,
+                                     mouthOpen: CGFloat,
+                                     eyeLook: CGVector,
+                                     eyeMode: EyeMode) {
+        let face = NSColor(srgbRed: 0.36, green: 0.10, blue: 0.05, alpha: 1)
+        let lookX = max(-1, min(1, eyeLook.dx))
+        let lookY = max(-1, min(1, eyeLook.dy))
+        let unit = min(rect.width, rect.height)
+        let eyeSize = CGSize(width: unit * 0.028, height: unit * 0.067)
+        let travel = CGSize(width: unit * 0.026, height: unit * 0.014)
+        let centers = [
+            CGPoint(x: rect.minX + rect.width * 0.405, y: rect.minY + rect.height * 0.523),
+            CGPoint(x: rect.minX + rect.width * 0.595, y: rect.minY + rect.height * 0.523),
+        ]
+
+        ctx.setFillColor(face.cgColor)
+        ctx.setStrokeColor(face.cgColor)
+        switch eyeMode {
+        case .normal:
+            for center in centers {
+                let eye = CGRect(x: center.x + travel.width * lookX - eyeSize.width / 2,
+                                 y: center.y + travel.height * lookY - eyeSize.height / 2,
+                                 width: eyeSize.width,
+                                 height: eyeSize.height)
+                ctx.fillEllipse(in: eye)
+            }
+        case .closed:
+            ctx.setLineCap(.round)
+            ctx.setLineWidth(unit * 0.014)
+            for center in centers {
+                ctx.beginPath()
+                ctx.move(to: CGPoint(x: center.x - eyeSize.width * 0.75, y: center.y))
+                ctx.addLine(to: CGPoint(x: center.x + eyeSize.width * 0.75, y: center.y))
+                ctx.strokePath()
+            }
+        case .happy:
+            ctx.setLineCap(.round)
+            ctx.setLineWidth(unit * 0.014)
+            let radius = eyeSize.width * 1.1
+            for center in centers {
+                ctx.beginPath()
+                ctx.addArc(center: CGPoint(x: center.x, y: center.y - radius * 0.35),
+                           radius: radius,
+                           startAngle: .pi * 0.18,
+                           endAngle: .pi * 0.82,
+                           clockwise: false)
+                ctx.strokePath()
+            }
+        }
+
+        let mouthCenter = CGPoint(x: rect.midX, y: rect.minY + rect.height * 0.418)
+        if mouthOpen > 0 {
+            let mouth = CGRect(x: mouthCenter.x - unit * 0.058,
+                               y: mouthCenter.y - unit * 0.034 * mouthOpen,
+                               width: unit * 0.116,
+                               height: unit * 0.068 * mouthOpen)
+            ctx.fillEllipse(in: mouth)
+        } else {
+            ctx.setLineCap(.round)
+            ctx.setLineWidth(unit * 0.014)
+            ctx.beginPath()
+            ctx.move(to: CGPoint(x: mouthCenter.x - unit * 0.055, y: mouthCenter.y))
+            ctx.addLine(to: CGPoint(x: mouthCenter.x + unit * 0.055, y: mouthCenter.y))
+            ctx.strokePath()
+        }
     }
 
     /// 跑步态只改原本底部两条腿:先用背景橙补掉静止腿,再画成交替前后摆动的短腿。
@@ -2314,7 +2404,7 @@ final class PetView: NSView {
     // MARK: 右键菜单
     override func menu(for event: NSEvent) -> NSMenu? {
         let menu = NSMenu()
-        let title = NSMenuItem(title: "Claude 桌面宠物", action: nil, keyEquivalent: "")
+        let title = NSMenuItem(title: "AgentPet 桌面宠物", action: nil, keyEquivalent: "")
         title.isEnabled = false
         menu.addItem(title)
         menu.addItem(.separator())
@@ -2324,7 +2414,7 @@ final class PetView: NSView {
         help.target = self
         menu.addItem(help)
         menu.addItem(.separator())
-        let askClaude = NSMenuItem(title: "问 Claude…", action: #selector(askClaudeMenu(_:)), keyEquivalent: "")
+        let askClaude = NSMenuItem(title: "问 cc…", action: #selector(askClaudeMenu(_:)), keyEquivalent: "")
         askClaude.target = self
         menu.addItem(askClaude)
         let askCodex = NSMenuItem(title: "问 Codex…", action: #selector(askCodexMenu(_:)), keyEquivalent: "")
@@ -2355,7 +2445,7 @@ final class PetView: NSView {
     @objc private func showHelp(_ sender: Any?) {
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
-        alert.messageText = "ClaudePet 使用说明"
+        alert.messageText = "AgentPet 使用说明"
         alert.addButton(withTitle: "知道了")
         let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 380, height: 440))
         scroll.hasVerticalScroller = true
@@ -2374,17 +2464,17 @@ final class PetView: NSView {
 
     /// 使用说明全文(右键"使用说明…"展示)。与仓库 README 内容对齐。
     private static let helpText = """
-    ClaudePet 桌面宠物 · 使用说明
+    AgentPet 桌面宠物 · 使用说明
 
     — 全局快捷键(任何应用里都生效) —
-      ⌥⌘C   Finder 选中的文件/目录 → 喂给 Claude 分析
+      ⌥⌘C   Finder 选中的文件/目录 → 喂给 cc 分析
       ⌥⌘X   Finder 选中的文件/目录 → 喂给 Codex 分析
-      ⌥⌘B   剪贴板里的文字 → 喂给 Claude
+      ⌥⌘B   剪贴板里的文字 → 喂给 cc
       ⌥⌘T   翻译选中的文字(中↔英),头顶气泡显示
 
     — 投喂(只读,绝不删改文件) —
-      • 把文件/目录拖到桌宠身上 → 喂给 Claude
-      • 双击桌宠,或右键"问 Claude…/问 Codex…" → 弹框打字或贴报错
+      • 把文件/目录拖到桌宠身上 → 喂给 cc
+      • 双击桌宠,或右键"问 cc…/问 Codex…" → 弹框打字或贴报错
       • 投喂时桌宠会扑到鼠标处张嘴嚼一口,随后在终端开会话
       • 优先用 cc/cx(官方命令+跳过确认);首次启动自动写进 ~/.zshrc,新开终端即用
 
@@ -2396,7 +2486,7 @@ final class PetView: NSView {
 
     — 陪跑(Claude Code · Codex,需接入通知钩子) —
       • 开工进专注态、等你确认时横幅催点头、收工报喜
-      • 右上角角标:正在执行显「跑N」、Claude 停下等你回答显「等N」(琥珀);答完一轮即消
+      • 右上角角标:正在执行显「跑N」、cc 停下等你回答显「等N」(琥珀);答完一轮即消
       • 报错/网络重试那轮也算收工(钩子接 StopFailure);客户端崩了按进程存活清角标
       • 点"报喜/等确认"横幅 → 把终端唤回前台(或用访达打开目录)
 
@@ -2440,10 +2530,10 @@ final class PetView: NSView {
     @objc private func testTaskDoneHint(_ sender: Any?) {
         // 演示带任务简介的自适应横幅:长任务会自动换行加高;带家目录,便于当场点横幅验证回现场
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        showTaskDoneHint(message: "Claude · 把登录模块重构成 async/await 并补全单元测试和错误处理", actionCwd: home, force: true)
+        showTaskDoneHint(message: "cc · 把登录模块重构成 async/await 并补全单元测试和错误处理", actionCwd: home, force: true)
     }
 
-    // 临时诊断:把 Dock 与微信辅助功能树的真实字段 dump 到 /tmp/claudepet.log,取证后移除
+    // 临时诊断:把 Dock 与微信辅助功能树的真实字段 dump 到 /tmp/agentpet.log,取证后移除
     @objc private func exportWeChatDiagnostics(_ sender: Any?) {
         Self.dumpWeChatAccessibilityTree()
         showWeChatNotificationHint(message: "已导出探测详情", force: true)
@@ -2533,7 +2623,7 @@ final class PetView: NSView {
     /// 把投喂脚本写到临时 .command 并用终端跑起来(文件投喂与文字投喂共用此收尾)。
     private static func runFeedScript(_ content: String) {
         let scriptURL = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("claudepet-feed-\(UUID().uuidString).command")
+            .appendingPathComponent("agentpet-feed-\(UUID().uuidString).command")
         do {
             try content.write(to: scriptURL, atomically: true, encoding: .utf8)
             try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
@@ -2607,7 +2697,7 @@ final class PetView: NSView {
         // 交互 shell 通常已含 Homebrew 路径,再查常见绝对路径;缺失时给可见提示,避免执行不存在的文件。
         return """
         #!/bin/zsh
-        # ClaudePet feed script v4: 投喂先用 cc/cx 包装(官方命令+跳过确认),没有再退官方 claude/codex
+        # AgentPet feed script v4: 投喂先用 cc/cx 包装(官方命令+跳过确认),没有再退官方 claude/codex
         cd \(shellQuoted(workingDir)) || exit 1
         TOOL=""
         for candidate in \(toolCandidates); do
@@ -2627,9 +2717,9 @@ final class PetView: NSView {
         rc=$?
         echo
         if [[ $rc -ne 0 ]]; then
-          echo "[ClaudePet] 工具异常退出(状态码 $rc),上方若有报错请据此排查。"
+          echo "[AgentPet] 工具异常退出(状态码 $rc),上方若有报错请据此排查。"
         fi
-        echo "[ClaudePet] 会话结束,按回车键关闭此窗口…"
+        echo "[AgentPet] 会话结束,按回车键关闭此窗口…"
         read < /dev/tty
         """
     }
@@ -2798,7 +2888,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             backing: .buffered,
             defer: false
         )
-        window.title = "ClaudePet 设置"
+        window.title = "AgentPet 设置"
         window.isReleasedWhenClosed = false
         window.contentView = content
         super.init(window: window)
@@ -3269,7 +3359,7 @@ enum ShellAliasInstaller {
 
         var appendText = ""
         if !addedLines.isEmpty {
-            appendText = "\n# ClaudePet 桌宠自动添加:cc/cx 命令简写(放飞版,跳过确认)\n"
+            appendText = "\n# AgentPet 桌宠自动添加:cc/cx 命令简写(放飞版,跳过确认)\n"
                 + addedLines.joined(separator: "\n") + "\n"
             if !dryRun {
                 var next = existing
@@ -3298,7 +3388,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let taskDoneThrottle: TimeInterval = 8
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        PetView.log("ClaudePet 启动 feed-script-v2")
+        PetView.log("AgentPet 启动 feed-script-v2")
         let appSize = Style.canvasSize
         let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         // 默认停在用户选定的角(缺省右下);origin 计算收敛进 DockCorner
@@ -3356,7 +3446,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 任务监控:按"挂载监控系统"开关起停内嵌 HTTP 服务(默认关闭,不启动则零开销)。
         TaskMonitor.reload()
 
-        // 远程文件任务:先把旧版 ~/ClaudePetRemoteFiles 迁到 Application Support 新位置、再把按日期分桶的历史任务拍平并洗 meta,最后后台回收超期/超量历史任务(不卡启动)。
+        // 远程文件任务:先把旧版 ~/AgentPetRemoteFiles 迁到 Application Support 新位置、再把按日期分桶的历史任务拍平并洗 meta,最后后台回收超期/超量历史任务(不卡启动)。
         DispatchQueue.global(qos: .utility).async {
             RemoteFileTask.migrateLegacyBaseIfNeeded()
             RemoteFileTask.migrateFlattenDateBucketsIfNeeded()
@@ -3400,16 +3490,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    // MARK: 任务完成通知:外部 CLI 完成后 open "claudepet://done?tool=...&cwd=..." 唤起报喜横幅
-    // Claude Code 的 Stop 钩子 / Codex 的 notify 各自落到一条 open 命令;Info.plist 已声明 claudepet 协议,
+    // MARK: 任务完成通知:外部 CLI 完成后 open "agentpet://done?tool=...&cwd=..." 唤起报喜横幅
+    // Claude Code 的 Stop 钩子 / Codex 的 notify 各自落到一条 open 命令;Info.plist 已声明 agentpet 协议,
     // 系统据此把 GetURL 事件转给下方回调。只读 URL 参数、弹横幅,不碰任何文件。
     func application(_ application: NSApplication, open urls: [URL]) {
-        for url in urls where url.scheme == "claudepet" {
-            handleClaudePetURL(url)
+        for url in urls where url.scheme == "agentpet" {
+            handleAgentPetURL(url)
         }
     }
 
-    private func handleClaudePetURL(_ url: URL) {
+    private func handleAgentPetURL(_ url: URL) {
         let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
         let phase = url.host ?? components?.host ?? ""
         guard ["start", "waiting", "done"].contains(phase) else { return }   // host 即生命周期相位
@@ -3445,7 +3535,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let who: String
         switch tool.lowercased() {
         case "codex", "cx": who = "Codex"
-        case "claude", "cc": who = "Claude"
+        case "claude", "cc": who = "cc"
         default: who = tool   // 未知工具原样带出;空字符串走下方兜底
         }
         let label = who.isEmpty ? "完成" : who
@@ -3468,7 +3558,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let who: String
         switch tool.lowercased() {
         case "codex", "cx": who = "Codex"
-        case "claude", "cc": who = "Claude"
+        case "claude", "cc": who = "cc"
         default: who = tool
         }
         let dir: String? = cwd.flatMap {
@@ -3542,7 +3632,7 @@ func runInstallAliasesSelfTest() -> Bool {
     func read(_ p: String) -> String { (try? String(contentsOfFile: p, encoding: .utf8)) ?? "" }
 
     // 场景1:文件不存在 → 追加 cc、cx 两行
-    let p1 = freshFile("claudepet-alias-st1.zshrc", nil)
+    let p1 = freshFile("agentpet-alias-st1.zshrc", nil)
     let r1 = ShellAliasInstaller.ensure(dryRun: false, path: p1)
     check(r1.added == ["cc", "cx"] && r1.existed.isEmpty, "文件不存在 → 追加 cc、cx")
     let body1 = read(p1)
@@ -3557,22 +3647,22 @@ func runInstallAliasesSelfTest() -> Bool {
     check(read(p1) == before2, "复跑 → 文件内容一字不变")
 
     // 场景3:只有 cc → 只补 cx
-    let p3 = freshFile("claudepet-alias-st3.zshrc", "alias cc=\"claude --dangerously-skip-permissions\"\n")
+    let p3 = freshFile("agentpet-alias-st3.zshrc", "alias cc=\"claude --dangerously-skip-permissions\"\n")
     let r3 = ShellAliasInstaller.ensure(dryRun: false, path: p3)
     check(r3.existed == ["cc"] && r3.added == ["cx"], "已有 cc → 只补 cx")
 
     // 场景4:cc 被注释掉 → 视为未定义,补 cc 与 cx
-    let p4 = freshFile("claudepet-alias-st4.zshrc", "# alias cc=\"old\"\n")
+    let p4 = freshFile("agentpet-alias-st4.zshrc", "# alias cc=\"old\"\n")
     let r4 = ShellAliasInstaller.ensure(dryRun: false, path: p4)
     check(r4.added.contains("cc") && r4.added.contains("cx"), "注释掉的 cc 不算 → 补 cc、cx")
 
     // 场景5:主公自定义了 cc(不同定义) → 尊重不覆盖,只补 cx
-    let p5 = freshFile("claudepet-alias-st5.zshrc", "alias cc=\"claude\"\n")
+    let p5 = freshFile("agentpet-alias-st5.zshrc", "alias cc=\"claude\"\n")
     let r5 = ShellAliasInstaller.ensure(dryRun: false, path: p5)
     check(r5.existed.contains("cc") && !r5.added.contains("cc"), "自定义 cc → 尊重不覆盖")
     check(read(p5).contains("alias cc=\"claude\"") && r5.added == ["cx"], "自定义 cc → 原定义保留、只补 cx")
 
-    for n in ["claudepet-alias-st1.zshrc", "claudepet-alias-st3.zshrc", "claudepet-alias-st4.zshrc", "claudepet-alias-st5.zshrc"] {
+    for n in ["agentpet-alias-st1.zshrc", "agentpet-alias-st3.zshrc", "agentpet-alias-st4.zshrc", "agentpet-alias-st5.zshrc"] {
         try? fm.removeItem(atPath: (dir as NSString).appendingPathComponent(n))
     }
     return pass
@@ -3582,21 +3672,21 @@ MainActor.assumeIsolated {
     let arguments = CommandLine.arguments
     if let idx = arguments.firstIndex(of: "--render-test") {
         // 自测模式:渲染一帧后退出
-        let out = idx + 1 < arguments.count ? arguments[idx + 1] : "/tmp/claudepet.png"
+        let out = idx + 1 < arguments.count ? arguments[idx + 1] : "/tmp/agentpet.png"
         renderSnapshot(to: out)
         exit(0)
     }
 
     if let idx = arguments.firstIndex(of: "--render-eat") {
         // 自测模式:渲染“张嘴进食”的一帧后退出,核对嘴的位置与大小
-        let out = idx + 1 < arguments.count ? arguments[idx + 1] : "/tmp/claudepet-eat.png"
+        let out = idx + 1 < arguments.count ? arguments[idx + 1] : "/tmp/agentpet-eat.png"
         renderSnapshot(to: out, mouthOpen: 1)
         exit(0)
     }
 
     if let idx = arguments.firstIndex(of: "--render-look") {
         // 自测模式:指定原图两个空位的偏移方向后渲染一帧,用法:--render-look [out.png] [dx] [dy]
-        let out = idx + 1 < arguments.count ? arguments[idx + 1] : "/tmp/claudepet-look.png"
+        let out = idx + 1 < arguments.count ? arguments[idx + 1] : "/tmp/agentpet-look.png"
         let dx = idx + 2 < arguments.count ? Double(arguments[idx + 2]) ?? 0 : 1
         let dy = idx + 3 < arguments.count ? Double(arguments[idx + 3]) ?? 0 : 0
         renderSnapshot(to: out, eyeLook: CGVector(dx: dx, dy: dy))
@@ -3605,21 +3695,21 @@ MainActor.assumeIsolated {
 
     if let idx = arguments.firstIndex(of: "--render-blink") {
         // 自测模式:渲染"闭眼"一帧(眨眼/哈欠时的眼形),核对水平细缝位置
-        let out = idx + 1 < arguments.count ? arguments[idx + 1] : "/tmp/claudepet-blink.png"
+        let out = idx + 1 < arguments.count ? arguments[idx + 1] : "/tmp/agentpet-blink.png"
         renderSnapshot(to: out, eyeMode: .closed)
         exit(0)
     }
 
     if let idx = arguments.firstIndex(of: "--render-happy") {
         // 自测模式:渲染"眯眼笑"一帧(弯月眼),核对悬停互动的笑脸
-        let out = idx + 1 < arguments.count ? arguments[idx + 1] : "/tmp/claudepet-happy.png"
+        let out = idx + 1 < arguments.count ? arguments[idx + 1] : "/tmp/agentpet-happy.png"
         renderSnapshot(to: out, eyeMode: .happy)
         exit(0)
     }
 
     if let idx = arguments.firstIndex(of: "--render-run") {
         // 自测模式:渲染跑步腿一帧,用法:--render-run [out.png] [1|2]
-        let out = idx + 1 < arguments.count ? arguments[idx + 1] : "/tmp/claudepet-run.png"
+        let out = idx + 1 < arguments.count ? arguments[idx + 1] : "/tmp/agentpet-run.png"
         let phase = idx + 2 < arguments.count ? Int(arguments[idx + 2]) ?? 1 : 1
         renderSnapshot(to: out, runPhase: phase)
         exit(0)
@@ -3627,7 +3717,7 @@ MainActor.assumeIsolated {
 
     if let idx = arguments.firstIndex(of: "--render-badge") {
         // 自测模式:渲染星芒 + 会话角标一帧;用法:--render-badge [out.png] [running] [waiting]
-        let out = idx + 1 < arguments.count ? arguments[idx + 1] : "/tmp/claudepet-badge.png"
+        let out = idx + 1 < arguments.count ? arguments[idx + 1] : "/tmp/agentpet-badge.png"
         let r = idx + 2 < arguments.count ? Int(arguments[idx + 2]) ?? 1 : 1
         let w = idx + 3 < arguments.count ? Int(arguments[idx + 3]) ?? 0 : 0
         renderSnapshot(to: out, badgeRunning: r, badgeWaiting: w)
@@ -3681,16 +3771,16 @@ MainActor.assumeIsolated {
     }
 
     if arguments.contains("--wechat-dump") {
-        // 临时诊断:把 Dock 与微信辅助功能树的真实字段 dump 到 /tmp/claudepet.log(命令行下若未授权则为空)
+        // 临时诊断:把 Dock 与微信辅助功能树的真实字段 dump 到 /tmp/agentpet.log(命令行下若未授权则为空)
         PetView.dumpWeChatAccessibilityTree()
-        print("已尝试导出微信探测详情到 /tmp/claudepet.log")
+        print("已尝试导出微信探测详情到 /tmp/agentpet.log")
         exit(0)
     }
 
     if let idx = arguments.firstIndex(of: "--notify-dryrun") {
-        // 自测模式:给定 claudepet:// URL,打印解析出的工具/目录与最终横幅文案,核对 URL 解析与文案拼装
-        // 用法:--notify-dryrun [claudepet://done?tool=codex&cwd=/path/to/repo],默认 claude
-        let raw = idx + 1 < arguments.count ? arguments[idx + 1] : "claudepet://done?tool=claude"
+        // 自测模式:给定 agentpet:// URL,打印解析出的工具/目录与最终横幅文案,核对 URL 解析与文案拼装
+        // 用法:--notify-dryrun [agentpet://done?tool=codex&cwd=/path/to/repo],默认 claude
+        let raw = idx + 1 < arguments.count ? arguments[idx + 1] : "agentpet://done?tool=claude"
         guard let url = URL(string: raw) else {
             FileHandle.standardError.write(Data("无法解析 URL:\(raw)\n".utf8))
             exit(1)
@@ -3757,7 +3847,7 @@ MainActor.assumeIsolated {
         let text = idx + 2 < arguments.count ? arguments[idx + 2] : "帮我看看这个报错"
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let exe = AgentRunner.resolveExecutable(for: tool)   // 本地 command -v 定位,不连网
-        let lastFile = NSTemporaryDirectory() + "claudepet-remote-\(tool == .codex ? "cx" : "cc")-last.txt"
+        let lastFile = NSTemporaryDirectory() + "agentpet-remote-\(tool == .codex ? "cx" : "cc")-last.txt"
         // shell 风格展示:含空格/引号/空串的参数用单引号包起,便于肉眼核对转义
         func show(_ args: [String]) -> String {
             ([exe ?? tool.label] + args).map { arg in
@@ -3850,7 +3940,7 @@ MainActor.assumeIsolated {
         let bot = TelegramBot(token: tokens[botIndex - 1], tool: tool, instanceLabel: "\(tool.label)#\(botIndex)",
                               ioTagPrefix: "\(tag)-bot\(botIndex)", home: FileManager.default.homeDirectoryForCurrentUser.path,
                               allowedChatIDs: [chatID]) { _, _, _ in }
-        let result = bot.sendDocument(chatID: chatID, fileURL: file, caption: "ClaudePet 回传诊断:\(file.lastPathComponent)")
+        let result = bot.sendDocument(chatID: chatID, fileURL: file, caption: "AgentPet 回传诊断:\(file.lastPathComponent)")
         print("Telegram sendDocument 诊断:\(result.ok ? "PASS" : "FAIL")")
         if !result.error.isEmpty { print("原因:\(result.error)") }
         exit(result.ok ? 0 : 2)

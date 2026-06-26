@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# 编译 Claude 桌面宠物并组装成 macOS .app 包
+# 编译 AgentPet 桌面宠物并组装成 macOS .app 包
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-APP="$ROOT/ClaudePet.app"
+APP="$ROOT/AgentPet.app"
 MACOS="$APP/Contents/MacOS"
-BIN="$MACOS/ClaudePet"
+BIN="$MACOS/AgentPet"
 CACHE="$ROOT/.build/module-cache"
 RESOURCES="$APP/Contents/Resources"
-INSTALL_APP="${INSTALL_APP:-/Applications/ClaudePet.app}"
+INSTALL_APP="${INSTALL_APP:-/Applications/AgentPet.app}"
 OPEN_AFTER_BUILD="${OPEN_AFTER_BUILD:-1}"
 
 echo "==> 清理旧产物"
@@ -34,15 +34,15 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleDevelopmentRegion</key>
     <string>zh_CN</string>
     <key>CFBundleDisplayName</key>
-    <string>ClaudePet</string>
+    <string>AgentPet</string>
     <key>CFBundleExecutable</key>
-    <string>ClaudePet</string>
+    <string>AgentPet</string>
     <key>CFBundleIdentifier</key>
-    <string>com.claude.pet</string>
+    <string>com.agent.pet</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>ClaudePet</string>
+    <string>AgentPet</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -56,15 +56,15 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <true/>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
-    <!-- 自定义 URL 协议:Claude Code / Codex 完成任务后 open "claudepet://done?..." 唤起桌宠报喜 -->
+    <!-- 自定义 URL 协议:Claude Code / Codex 完成任务后 open "agentpet://done?..." 唤起桌宠报喜 -->
     <key>CFBundleURLTypes</key>
     <array>
         <dict>
             <key>CFBundleURLName</key>
-            <string>com.claude.pet.feed</string>
+            <string>com.agent.pet.feed</string>
             <key>CFBundleURLSchemes</key>
             <array>
-                <string>claudepet</string>
+                <string>agentpet</string>
             </array>
         </dict>
     </array>
@@ -74,6 +74,11 @@ PLIST
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 echo "==> 写入 cc / cx 包装命令(投喂优先用它们 = 官方命令 + 跳过确认参数,对应主公的 cc/cx 别名)"
+if compgen -G "$ROOT/Resources/*.png" >/dev/null; then
+  echo "==> 复制图片资源"
+  cp "$ROOT"/Resources/*.png "$RESOURCES"/
+fi
+
 cat > "$RESOURCES/cc" <<'SH'
 #!/usr/bin/env zsh
 exec /opt/homebrew/bin/claude --dangerously-skip-permissions "$@"
@@ -88,7 +93,7 @@ chmod +x "$RESOURCES/cx"
 echo "==> code signing"
 SIGN_IDENTITY="${SIGN_IDENTITY:-}"
 if [[ -z "$SIGN_IDENTITY" ]]; then
-  SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | awk -F '"' '/ClaudePet Local Code Signing/ {print $2; exit}')"
+  SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | awk -F '"' '/AgentPet Local Code Signing/ {print $2; exit}')"
 fi
 if [[ -z "$SIGN_IDENTITY" ]]; then
   SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | awk -F '"' '/Apple Development/ {print $2; exit}')"
@@ -104,8 +109,8 @@ fi
 
 if [[ -n "$INSTALL_APP" ]]; then
   echo "==> 安装到 $INSTALL_APP"
-  if pgrep -x ClaudePet >/dev/null 2>&1; then
-    pkill -x ClaudePet || true
+  if pgrep -x AgentPet >/dev/null 2>&1; then
+    pkill -x AgentPet || true
     sleep 1
   fi
   rm -rf "$INSTALL_APP"

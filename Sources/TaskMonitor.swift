@@ -1,5 +1,5 @@
 // MARK: - 任务监控:把远程遥控(Telegram / 飞书)每一轮"问题→答案"连同发起人、耗时、花费落盘,
-// 并内嵌一个零依赖的本地 HTTP 服务对外暴露这些数据,供独立前端项目 claude-pet-monitor 做仪表盘。
+// 并内嵌一个零依赖的本地 HTTP 服务对外暴露这些数据,供独立前端项目 agent-pet-monitor 做仪表盘。
 //
 // 本模块刻意独立成文件(不并进 main.swift):监控链路自洽,记录与服务都不碰桌宠外观。
 // 仍由 build.sh 与 main.swift / RemoteControl.swift / FeishuRemote.swift 一起 `swiftc -swift-version 5` 编进同一二进制。
@@ -17,8 +17,8 @@ import Network
 struct AgentMetrics {
     var cliDurationMs: Int?     // claude result.duration_ms
     var costUSD: Double?        // claude result.total_cost_usd
-    var inputTokens: Int?       // Claude/Codex 输入 token
-    var outputTokens: Int?      // Claude/Codex 输出 token(含推理输出)
+    var inputTokens: Int?       // cc/cx 输入 token
+    var outputTokens: Int?      // cc/cx 输出 token(含推理输出)
     var numTurns: Int?          // claude result.num_turns
 }
 
@@ -37,8 +37,8 @@ struct TaskRecord: Codable {
     let durationMs: Int         // 墙钟时长(从收到到答完)
     let cliDurationMs: Int?     // CLI 自报时长(仅 claude)
     let costUSD: Double?        // 本轮花费美元(仅 claude)
-    let inputTokens: Int?       // 输入 token(Claude/Codex 能拿则填)
-    let outputTokens: Int?      // 输出 token(Claude/Codex 能拿则填)
+    let inputTokens: Int?       // 输入 token(cc/cx 能拿则填)
+    let outputTokens: Int?      // 输出 token(cc/cx 能拿则填)
     let numTurns: Int?          // 内部回合数(仅 claude)
     let status: String          // ok | timeout | error
     let sessionID: String?      // 续接会话 id
@@ -47,14 +47,14 @@ struct TaskRecord: Codable {
 /// 记录存储:追加 JSONL、整文件读回。所有文件读写串到一条串行队列,避免并发写串行。
 enum TaskMonitorStore {
     /// 串行队列:记录来自不同用户的多条后台线程,统一串行写,杜绝交错。
-    private static let queue = DispatchQueue(label: "claudepet.monitor.store")
+    private static let queue = DispatchQueue(label: "agentpet.monitor.store")
     private static var counter = 0
 
-    /// 数据目录:~/Library/Application Support/com.claude.pet/monitor。卸载前端不影响这里的历史。
+    /// 数据目录:~/Library/Application Support/com.agent.pet/monitor。卸载前端不影响这里的历史。
     static var dataDirectory: String {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?.path
             ?? (NSHomeDirectory() + "/Library/Application Support")
-        return base + "/com.claude.pet/monitor"
+        return base + "/com.agent.pet/monitor"
     }
 
     static var logPath: String { dataDirectory + "/tasks.jsonl" }
@@ -149,7 +149,7 @@ final class MonitorServer {
     private let port: UInt16
     private let pluginDir: String?           // 前端 dist 目录;为 nil 或不存在则回退内置页面
     private var listener: NWListener?
-    private let queue = DispatchQueue(label: "claudepet.monitor.server")
+    private let queue = DispatchQueue(label: "agentpet.monitor.server")
 
     init(port: UInt16, pluginDir: String?) {
         self.port = port
@@ -300,7 +300,7 @@ final class MonitorServer {
     static let fallbackPage = """
     <!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1">
-    <title>ClaudePet 任务监控</title>
+    <title>AgentPet 任务监控</title>
     <style>
     body{font:14px/1.6 -apple-system,system-ui,sans-serif;margin:0;background:#f5f5f7;color:#1d1d1f}
     header{padding:16px 24px;background:#fff;border-bottom:1px solid #e5e5e7;display:flex;align-items:center;gap:16px}
@@ -315,8 +315,8 @@ final class MonitorServer {
     .tag{display:inline-block;padding:1px 8px;border-radius:6px;font-size:12px;background:#eef;color:#3355cc}
     .muted{color:#86868b}.empty{padding:48px;text-align:center;color:#86868b}
     </style></head><body>
-    <header><h1>🐾 ClaudePet 任务监控</h1><span class="muted" id="updated"></span>
-    <span class="muted" style="margin-left:auto">内置回退页 · 构建 claude-pet-monitor 可得完整仪表盘</span></header>
+    <header><h1>🐾 AgentPet 任务监控</h1><span class="muted" id="updated"></span>
+    <span class="muted" style="margin-left:auto">内置回退页 · 构建 agent-pet-monitor 可得完整仪表盘</span></header>
     <div class="stats" id="stats"></div>
     <table id="tbl"><thead><tr><th>时间</th><th>来源/发起人</th><th>工具</th><th>问题</th><th>答案</th><th>时长</th><th>花费</th></tr></thead><tbody></tbody></table>
     <script>
@@ -357,14 +357,14 @@ enum TaskMonitor {
     /// 当前是否在服务中(开关已挂载)。
     static var isRunning: Bool { server != nil }
 
-    /// 计算前端 dist 目录:相对 app 包定位到兄弟项目 claude-pet-monitor/dist。
-    /// app 在 <根>/claude-pet/ClaudePet.app → 兄弟项目在 <根>/claude-pet-monitor/dist。找不到返回 nil(走内置回退页)。
+    /// 计算前端 dist 目录:相对 app 包定位到兄弟项目 agent-pet-monitor/dist。
+    /// app 在当前仓库目录的 AgentPet.app → 兄弟项目在 <上级>/agent-pet-monitor/dist。找不到返回 nil(走内置回退页)。
     static func resolvePluginDir() -> String? {
         let override = Settings.monitorPluginPath
         if !override.isEmpty { return FileManager.default.fileExists(atPath: override) ? override : nil }
-        let appDir = (Bundle.main.bundlePath as NSString).deletingLastPathComponent      // .../claude-pet
+        let appDir = (Bundle.main.bundlePath as NSString).deletingLastPathComponent      // 当前仓库目录
         let parent = (appDir as NSString).deletingLastPathComponent                       // .../(上一层)
-        let dist = parent + "/claude-pet-monitor/dist"
+        let dist = parent + "/agent-pet-monitor/dist"
         return FileManager.default.fileExists(atPath: dist) ? dist : nil
     }
 

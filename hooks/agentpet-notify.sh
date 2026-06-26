@@ -1,28 +1,28 @@
 #!/bin/bash
-# ClaudePet 生命周期通知转发器
+# AgentPet 生命周期通知转发器
 # 把 Claude Code / Codex 的生命周期事件,转成一次
-#     open "claudepet://<phase>?tool=<claude|codex>&sid=<会话>&cwd=<目录>&task=<简介>&tty=<终端设备>&ts=<事件时间戳>&pid=<会话进程pid>"
+#     open "agentpet://<phase>?tool=<claude|codex>&sid=<会话>&cwd=<目录>&task=<简介>&tty=<终端设备>&ts=<事件时间戳>&pid=<会话进程pid>"
 # 唤起桌宠陪跑:开工(start)进专注态、等确认(waiting)弹横幅提醒、收工(done)庆祝。
 # 只读事件与会话记录、只 open 一个自定义 URL,绝不改动任何文件。
 #
 # 用法(第 2 个参数是 phase,取值 start|waiting|done,缺省 done):
 #   Claude Code —— ~/.claude/settings.json 各钩子(事件 JSON 从 stdin 传入):
-#       UserPromptSubmit: { "type":"command", "command":"/绝对路径/claudepet-notify.sh claude start" }
-#       Notification:     { "type":"command", "command":"/绝对路径/claudepet-notify.sh claude waiting" }
-#       Stop:             { "type":"command", "command":"/绝对路径/claudepet-notify.sh claude done" }
-#       StopFailure:      { "type":"command", "command":"/绝对路径/claudepet-notify.sh claude done" }
+#       UserPromptSubmit: { "type":"command", "command":"/绝对路径/agentpet-notify.sh claude start" }
+#       Notification:     { "type":"command", "command":"/绝对路径/agentpet-notify.sh claude waiting" }
+#       Stop:             { "type":"command", "command":"/绝对路径/agentpet-notify.sh claude done" }
+#       StopFailure:      { "type":"command", "command":"/绝对路径/agentpet-notify.sh claude done" }
 #       注:Stop 只在正常答完时触发;网络/接口报错、重试耗尽那轮走 StopFailure(Claude Code 2.1.78+),
 #           两个都接 done,角标「跑 N」才不会卡到 10 分钟超时才清。本脚本按 argv 定相位,done 直接复用。
 #   Codex 0.140+ —— ~/.codex/config.toml 顶部开 codex_hooks = true,再用 inline [hooks](事件 JSON 从 stdin 传入):
 #       UserPromptSubmit → start / PermissionRequest → waiting / Stop → done
-#       command = ["/绝对路径/claudepet-notify.sh", "codex", "start"]   (waiting/done 同理)
-#   兼容旧 Codex notify = ["/绝对路径/claudepet-notify.sh","codex"](事件 JSON 作末位参数):无 phase → 当 done。
+#       command = ["/绝对路径/agentpet-notify.sh", "codex", "start"]   (waiting/done 同理)
+#   兼容旧 Codex notify = ["/绝对路径/agentpet-notify.sh","codex"](事件 JSON 作末位参数):无 phase → 当 done。
 #
 # 会话标识 sid:优先取事件 JSON 的 session_id(拿不到退回 tool|cwd),桌宠据此聚合多终端并发,
 # 任意会话在跑就保持专注,全部收工才歇。cwd 优先取 JSON,缺失则用脚本运行目录(PWD)兜底。
 #
-# 自测:设 CLAUDEPET_NOTIFY_DRYRUN=1 则只打印将要 open 的 URL,不真正唤起,例如:
-#   CLAUDEPET_NOTIFY_DRYRUN=1 ./hooks/claudepet-notify.sh codex start '{"cwd":"/tmp/demo","input-messages":["重构登录模块"]}'
+# 自测:设 AGENTPET_NOTIFY_DRYRUN=1 则只打印将要 open 的 URL,不真正唤起,例如:
+#   AGENTPET_NOTIFY_DRYRUN=1 ./hooks/agentpet-notify.sh codex start '{"cwd":"/tmp/demo","input-messages":["重构登录模块"]}'
 
 set -u
 tool="${1:-claude}"
@@ -179,17 +179,17 @@ if len(task) > 60:
 q = urllib.parse.quote
 # ts:事件生成时刻(epoch 秒)。hook 一发即走、LaunchServices 不保证按序投递,桌宠据此对同一 sid 的乱序事件定序去旧。
 # pid:承载本会话的 claude/codex 进程 pid(可空),桌宠超时兜底前先 kill(0) 探活,进程退出即清角标。
-print("claudepet://%s?tool=%s&sid=%s&cwd=%s&task=%s&tty=%s&ts=%s%s"
+print("agentpet://%s?tool=%s&sid=%s&cwd=%s&task=%s&tty=%s&ts=%s%s"
       % (q(phase), q(tool), q(sid, safe=""), q(cwd), q(task), q(tty, safe=""), time.time(),
          ("&pid=" + q(spid, safe="")) if spid else ""))
 ')"
 
 # python3 缺失或异常导致 url 为空时,降级为只带 phase 与 tool,保证功能不哑火
 if [ -z "$url" ]; then
-  url="claudepet://${phase}?tool=${tool}"
+  url="agentpet://${phase}?tool=${tool}"
 fi
 
-if [ -n "${CLAUDEPET_NOTIFY_DRYRUN:-}" ]; then
+if [ -n "${AGENTPET_NOTIFY_DRYRUN:-}" ]; then
   printf '%s\n' "$url"
   exit 0
 fi

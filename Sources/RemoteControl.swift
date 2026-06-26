@@ -133,7 +133,7 @@ enum AgentRunner {
         guard let exe = resolveExecutable(for: tool) else {
             return AgentReply(text: "找不到 \(tool.label) CLI,请先安装或加入 PATH。", sessionID: sessionID, status: "error")
         }
-        let lastFile = NSTemporaryDirectory() + "claudepet-remote-\(tool == .codex ? "cx" : "cc")-\(ioTag)-last.txt"
+        let lastFile = NSTemporaryDirectory() + "agentpet-remote-\(tool == .codex ? "cx" : "cc")-\(ioTag)-last.txt"
         try? FileManager.default.removeItem(atPath: lastFile)
         let args = command(for: tool, prompt: prompt, sessionID: sessionID, cwd: cwd, lastFile: lastFile)
 
@@ -414,13 +414,13 @@ struct RemoteBotProfileRecord: Codable {
 enum RemoteBotProfileStore {
     private struct Database: Codable { var records: [String: RemoteBotProfileRecord] = [:] }
 
-    private static let queue = DispatchQueue(label: "claudepet.remote.profile.store")
+    private static let queue = DispatchQueue(label: "agentpet.remote.profile.store")
     static var overridePathForTesting: String?
 
     static var dataDirectory: String {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?.path
             ?? (NSHomeDirectory() + "/Library/Application Support")
-        return base + "/com.claude.pet"
+        return base + "/com.agent.pet"
     }
 
     static var filePath: String { overridePathForTesting ?? (dataDirectory + "/remote-profiles.json") }
@@ -540,7 +540,7 @@ enum RemoteBotSetup {
 
     static func runSelfTest() -> Bool {
         let oldPath = RemoteBotProfileStore.overridePathForTesting
-        let tmp = NSTemporaryDirectory() + "claudepet-remote-profile-selftest-\(UUID().uuidString).json"
+        let tmp = NSTemporaryDirectory() + "agentpet-remote-profile-selftest-\(UUID().uuidString).json"
         RemoteBotProfileStore.overridePathForTesting = tmp
         defer {
             RemoteBotProfileStore.overridePathForTesting = oldPath
@@ -861,7 +861,7 @@ struct RemoteFileTask {
     let outbox: URL
     let meta: URL
 
-    /// 远程文件任务根目录:Application Support 下,与 monitor / profiles 同处 com.claude.pet 一棵树。
+    /// 远程文件任务根目录:Application Support 下,与 monitor / profiles 同处 com.agent.pet 一棵树。
     /// create / latestExisting / cleanup 共用此单点。
     static func defaultBaseDirectory() -> URL {
         URL(fileURLWithPath: RemoteBotProfileStore.dataDirectory, isDirectory: true)
@@ -870,10 +870,10 @@ struct RemoteFileTask {
 
     /// 旧版根目录(home 根下的可见目录)。仅供启动迁移把历史任务搬到新位置,新代码不再往这里写。
     static func legacyBaseDirectory() -> URL {
-        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("ClaudePetRemoteFiles", isDirectory: true)
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("AgentPetRemoteFiles", isDirectory: true)
     }
 
-    /// 把旧版 ~/ClaudePetRemoteFiles 的历史任务迁到新位置。幂等:旧目录不在即跳过,可反复调用。
+    /// 把旧版 ~/AgentPetRemoteFiles 的历史任务迁到新位置。幂等:旧目录不在即跳过,可反复调用。
     /// 新位置整个不存在 → 整目录搬过去(同卷为原子 rename,快);新位置已存在 → 逐任务合并搬,再清掉旧空壳。
     /// 默认走真实路径;自测传 oldBase/newBase 用临时目录,绝不碰主公真实文件。返回迁移任务数(整目录搬记 1)。
     @discardableResult
@@ -1311,7 +1311,7 @@ struct RemoteFileTask {
     /// 清理逻辑离线自测:临时目录造"超期/近期/超量"任务,核对按天删旧留新、按容量删最旧、阈值≤0 跳过、空壳回收。
     static func runCleanupSelfTest() -> Bool {
         let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-            .appendingPathComponent("claudepet-file-cleanup-dryrun-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("agentpet-file-cleanup-dryrun-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let fm = FileManager.default
         let now = Date(timeIntervalSince1970: 1_782_066_615)
@@ -1419,30 +1419,31 @@ struct RemoteFileTask {
 
     static func runSelfTest() -> Bool {
         let base = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-            .appendingPathComponent("claudepet-file-task-dryrun-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("agentpet-file-task-dryrun-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: base) }
         do {
             let fixed = Date(timeIntervalSince1970: 1_782_066_615)
-            let task = try create(platform: "telegram", botID: "cx-bot2", remoteUserID: "8231781034", now: fixed, baseDirectory: base)
+            let sampleRemoteUserID = "1000000000"
+            let task = try create(platform: "telegram", botID: "cx-bot2", remoteUserID: sampleRemoteUserID, now: fixed, baseDirectory: base)
             let unsafe = "../.secret/report:1.txt"
             let dest = task.reserveInboxURL(fileName: unsafe)
             try Data("inbox".utf8).write(to: dest)
             let input = InputFile(sourceKind: "document", fileID: "FILE-ID", originalName: unsafe,
                                   storedName: dest.lastPathComponent, path: dest.path, size: 5, mimeType: "text/plain")
-            try task.writeMeta(chatID: "8231781034", senderName: "主公", toolLabel: "cx/codex", requestText: "处理这个文件", files: [input])
+            try task.writeMeta(chatID: sampleRemoteUserID, senderName: "主公", toolLabel: "cx/codex", requestText: "处理这个文件", files: [input])
             try Data("out".utf8).write(to: task.outbox.appendingPathComponent("result.txt"))
             try FileManager.default.createDirectory(at: task.outbox.appendingPathComponent("nested", isDirectory: true),
                                                     withIntermediateDirectories: true)
-            let newer = try create(platform: "telegram", botID: "cx-bot2", remoteUserID: "8231781034",
+            let newer = try create(platform: "telegram", botID: "cx-bot2", remoteUserID: sampleRemoteUserID,
                                    now: fixed.addingTimeInterval(60), baseDirectory: base)
             try Data("new".utf8).write(to: newer.inbox.appendingPathComponent("new.txt"))
-            try newer.writeMeta(chatID: "8231781034", senderName: "主公", toolLabel: "cx/codex", requestText: "新文件", files: [])
+            try newer.writeMeta(chatID: sampleRemoteUserID, senderName: "主公", toolLabel: "cx/codex", requestText: "新文件", files: [])
             let metaText = try String(contentsOf: task.meta, encoding: .utf8)
             let outbox = task.outboxFiles().map(\.lastPathComponent)
             let followUp = task.followUpPrompt(userRequest: "把刚才那个文件再整理一下")
-            let latest = latestExisting(platform: "telegram", botID: "cx-bot2", remoteUserID: "8231781034", baseDirectory: base)
-            let ok = task.root.deletingLastPathComponent().lastPathComponent == "8231781034"   // 扁平:任务直挂用户目录,中间无 年/月/日 壳
-                && task.root.path.contains("/telegram/cx-bot2/8231781034/")
+            let latest = latestExisting(platform: "telegram", botID: "cx-bot2", remoteUserID: sampleRemoteUserID, baseDirectory: base)
+            let ok = task.root.deletingLastPathComponent().lastPathComponent == sampleRemoteUserID   // 扁平:任务直挂用户目录,中间无 年/月/日 壳
+                && task.root.path.contains("/telegram/cx-bot2/\(sampleRemoteUserID)/")
                 && !metaText.contains("\"root\"") && !metaText.contains("\"inbox\"")   // meta 不再落绝对路径字段
                 && task.inbox.lastPathComponent == "inbox"
                 && task.work.lastPathComponent == "work"
@@ -1532,7 +1533,7 @@ final class TelegramBot {
     private func context(for remoteUserID: String) -> ChatContext {
         if let ctx = contexts[remoteUserID] { return ctx }
         let tag = tool == .codex ? "cx" : "cc"
-        let ctx = ChatContext(tool: tool, cwd: home, label: "claudepet.remote.\(tag).\(ioTagPrefix).\(remoteUserID)")
+        let ctx = ChatContext(tool: tool, cwd: home, label: "agentpet.remote.\(tag).\(ioTagPrefix).\(remoteUserID)")
         contexts[remoteUserID] = ctx
         PetView.log("Telegram[\(instanceLabel)] 新建会话 user \(remoteUserID),默认目录 \(home)")
         return ctx
@@ -1718,7 +1719,7 @@ final class TelegramBot {
             return
         }
 
-        // 新建任务后机会式回收历史文件(带 6 小时节流,绝大多数调用直接返回),防 ~/ClaudePetRemoteFiles 永久堆积。
+        // 新建任务后机会式回收历史文件(带 6 小时节流,绝大多数调用直接返回),防 ~/AgentPetRemoteFiles 永久堆积。
         RemoteFileTask.maybeCleanup()
 
         var saved: [RemoteFileTask.InputFile] = []
@@ -1889,7 +1890,7 @@ final class TelegramBot {
               let result = obj["result"] as? [String: Any],
               let filePath = result["file_path"] as? String,
               !filePath.isEmpty else {
-            throw NSError(domain: "ClaudePetTelegramFile", code: 1,
+            throw NSError(domain: "AgentPetTelegramFile", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "getFile 没有返回可下载路径"])
         }
         let remoteName = attachment.fileName ?? URL(fileURLWithPath: filePath).lastPathComponent
@@ -1899,7 +1900,7 @@ final class TelegramBot {
         }.joined(separator: "/")
         guard let url = URL(string: "https://api.telegram.org/file/bot\(token)/\(encodedPath)"),
               let data = syncRawData(URLRequest(url: url)) else {
-            throw NSError(domain: "ClaudePetTelegramFile", code: 2,
+            throw NSError(domain: "AgentPetTelegramFile", code: 2,
                           userInfo: [NSLocalizedDescriptionKey: "下载文件失败"])
         }
         try data.write(to: dest, options: .atomic)
@@ -1936,7 +1937,7 @@ final class TelegramBot {
     /// 文件任务回复给用户时去掉内部路径和长篇过程,内部日志仍保留完整信息。
     private func userFacingReply(_ text: String, fileTask: RemoteFileTask?) -> String {
         guard fileTask != nil else { return text }
-        let blocked = ["ClaudePetRemoteFiles", "/Users/", "/var/", "inbox/", "work/", "outbox/", "meta.json",
+        let blocked = ["AgentPetRemoteFiles", "/Users/", "/var/", "inbox/", "work/", "outbox/", "meta.json",
                        "本次 Telegram 文件任务目录", "收到的原始文件", "处理中间文件", "需要回传",
                        "```bash", "```sh", "```zsh", "```shell", "$ ", "/bin/", "/usr/bin/", "/opt/homebrew/",
                        "命令:", "命令：", "执行命令", "运行命令", "command:"]
@@ -1959,7 +1960,7 @@ final class TelegramBot {
             return "🔄 正在处理文件…"
         }
         let sensitive = ["$ ", "/Users/", "/var/", "/bin/", "/usr/bin/", "/opt/homebrew/",
-                         "ClaudePetRemoteFiles", "inbox/", "work/", "outbox/", "meta.json"]
+                         "AgentPetRemoteFiles", "inbox/", "work/", "outbox/", "meta.json"]
         if line.hasPrefix("🔧") || sensitive.contains(where: { line.contains($0) }) {
             return "🔧 正在处理"
         }
@@ -1990,7 +1991,7 @@ final class TelegramBot {
               let data = try? Data(contentsOf: fileURL) else {
             return SendFileResult(ok: false, error: "本地文件不存在或不可读")
         }
-        let boundary = "ClaudePetBoundary-\(UUID().uuidString)"
+        let boundary = "AgentPetBoundary-\(UUID().uuidString)"
         var body = Data()
         func append(_ text: String) { body.append(Data(text.utf8)) }
         func field(_ name: String, _ value: String) {
@@ -2241,7 +2242,7 @@ enum RemoteFeatureAnnouncement {
     static let version = "remoteBotPersonalizedSetup.v1"
 
     static let message = """
-    ✨ ClaudePet 远程 Bot 个性化设置上线啦
+    ✨ AgentPet 远程 Bot 个性化设置上线啦
 
     各位主公请注意：
     从现在开始，远程 Bot 不再是一个冷冰冰的打工机器了。
@@ -2485,15 +2486,15 @@ final class RemoteControlWindowController: NSWindowController {
         // ── Telegram ──
         section("Telegram", y: 652)
         note("每个人可各建专属 bot;多枚 token 用逗号/空格分隔。发消息后用 getUpdates 看 chat id。", y: 634)
-        label("Claude(cc)bot tokens(可多枚)", y: 608); field(claudeTokenField, y: 584)
+        label("cc bot tokens(可多枚)", y: 608); field(claudeTokenField, y: 584)
         label("Codex(cx)bot tokens(可多枚)", y: 556); field(codexTokenField, y: 532)
         label("允许的 chat id(逗号/空格分隔,留空=不限,但不安全)", y: 504); field(allowedField, y: 480)
 
         // ── 飞书 ──
         section("飞书(Feishu,仅国内版 open.feishu.cn)", y: 444)
         note("各建企业自建应用:开机器人 + im:message 权限,事件订阅选「长连接」订 im.message.receive_v1。", y: 422)
-        label("Claude(cc)App ID", y: 398); field(feishuClaudeAppIDField, y: 374)
-        label("Claude(cc)App Secret", y: 346); field(feishuClaudeAppSecretField, y: 322)
+        label("cc App ID", y: 398); field(feishuClaudeAppIDField, y: 374)
+        label("cc App Secret", y: 346); field(feishuClaudeAppSecretField, y: 322)
         label("Codex(cx)App ID", y: 294); field(feishuCodexAppIDField, y: 270)
         label("Codex(cx)App Secret", y: 242); field(feishuCodexAppSecretField, y: 218)
         label("允许的 open_id(逗号/空格分隔,留空=不限,但不安全)", y: 190); field(feishuAllowedField, y: 166)
