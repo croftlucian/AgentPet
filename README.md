@@ -214,6 +214,7 @@ BIN=./AgentPet.app/Contents/MacOS/AgentPet
 "$BIN" --render-happy [out.png]                # 眯眼笑
 "$BIN" --render-run   [out.png] [1|2]          # 跑步腿
 "$BIN" --render-badge [out.png] [running] [waiting] # 会话角标
+"$BIN" --render-banner [out.png] [文案]        # 像素游戏标题栏横幅
 
 # 投喂 / 翻译 / 通知(打印结果,不真正执行)
 "$BIN" --feed-dryrun  <路径> [claude|codex]    # 文件投喂脚本(核对路径转义)

@@ -23,9 +23,9 @@ private enum Style {
     static let windowSize: CGFloat = 90
     /// 通知横幅尺寸:窗口额外留出顶部透明区域,平时不显示文字(微信未读 / Claude·Codex 任务完成共用)。
     /// 高度自适应:短文案=单行(bannerMinHeight),长任务简介自动换行加高,上限 bannerMaxHeight。
-    static let bannerWidth: CGFloat = 210
-    static let bannerMinHeight: CGFloat = 34
-    static let bannerMaxHeight: CGFloat = 116
+    static let bannerWidth: CGFloat = 260
+    static let bannerMinHeight: CGFloat = 54
+    static let bannerMaxHeight: CGFloat = 86
     static let bannerGap: CGFloat = 6
     static var canvasSize: CGSize {
         CGSize(width: bannerWidth, height: windowSize + bannerGap + bannerMaxHeight)
@@ -391,7 +391,7 @@ final class PetView: NSView {
     private let iconLayer = CALayer()
     /// 通知横幅:比跳一下更明确,平时完全透明(微信未读 / 任务完成共用)
     private let bannerLayer = CALayer()
-    private let bannerTextLayer = CATextLayer()
+    private let bannerBackdropLayer = CALayer()
     /// 单一外观状态:嘴张幅(0~1)、眼神偏移、眼形(睁/闭/弯月笑)。任何动作改这几个值后调 render() 即刻重绘。
     /// 不再预渲染多帧——表情维度一多,组合会爆炸;统一一处出图反而更省、更清晰。
     private var mouthOpen: CGFloat = 0
@@ -474,6 +474,9 @@ final class PetView: NSView {
     /// 临时桌宠皮肤:先加载主公选中的高清像素 PNG 试效果;资源缺失时自动回退到代码绘制星芒。
     private static let petSkin = Bundle.main.url(forResource: "agent-pet-skin", withExtension: "png")
         .flatMap { NSImage(contentsOf: $0) }
+    /// 横幅背景试用第 5 款像素标题图;资源缺失时自动回退到代码绘制背景。
+    private static let pixelTitleBannerBackground = Bundle.main.url(forResource: "pixel-title-banner", withExtension: "png")
+        .flatMap { NSImage(contentsOf: $0) }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -524,26 +527,21 @@ final class PetView: NSView {
                                          y: Style.windowSize + Style.bannerGap,
                                          width: Style.bannerWidth,
                                          height: Style.bannerMinHeight)
-        bannerLayer.cornerRadius = 8
-        bannerLayer.backgroundColor = NSColor(srgbRed: 0.08, green: 0.09, blue: 0.10, alpha: 0.92).cgColor
-        bannerLayer.borderWidth = 1
-        bannerLayer.borderColor = Style.orange.cgColor // 默认色;每次 showBanner 按通知类型覆盖(微信绿 / 任务橙)
+        bannerLayer.cornerRadius = 0
+        bannerLayer.backgroundColor = NSColor.clear.cgColor
+        bannerLayer.borderWidth = 0
         bannerLayer.shadowColor = NSColor.black.cgColor
-        bannerLayer.shadowRadius = 8
-        bannerLayer.shadowOpacity = 0.28
-        bannerLayer.shadowOffset = CGSize(width: 0, height: -2)
+        bannerLayer.shadowRadius = 0
+        bannerLayer.shadowOpacity = 0.42
+        bannerLayer.shadowOffset = CGSize(width: 4, height: -4)
         bannerLayer.opacity = 0
 
-        bannerTextLayer.frame = CGRect(x: 12, y: 7, width: Style.bannerWidth - 24, height: 20)
-        bannerTextLayer.contentsScale = scale
-        bannerTextLayer.alignmentMode = .center
-        bannerTextLayer.isWrapped = true            // 长任务简介自动换行,配合 showBanner 测高自适应
-        bannerTextLayer.truncationMode = .end
-        bannerTextLayer.foregroundColor = NSColor.white.cgColor
-        bannerTextLayer.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
-        bannerTextLayer.fontSize = 13
-        bannerTextLayer.string = ""
-        bannerLayer.addSublayer(bannerTextLayer)
+        bannerBackdropLayer.frame = bannerLayer.bounds
+        bannerBackdropLayer.contentsScale = scale
+        bannerBackdropLayer.contentsGravity = .resize
+        bannerBackdropLayer.magnificationFilter = .nearest
+        bannerBackdropLayer.minificationFilter = .nearest
+        bannerLayer.addSublayer(bannerBackdropLayer)
         layer?.addSublayer(bannerLayer)
     }
 
@@ -559,7 +557,7 @@ final class PetView: NSView {
         super.viewDidMoveToWindow()
         guard let window else { return }
         iconLayer.contentsScale = window.backingScaleFactor // 适配真实屏幕缩放,保证清晰
-        bannerTextLayer.contentsScale = window.backingScaleFactor
+        bannerBackdropLayer.contentsScale = window.backingScaleFactor
         badgeLayer.contentsScale = window.backingScaleFactor
         render()              // 缩放确定后重绘一帧,保证清晰
         startBreathing()
@@ -908,23 +906,13 @@ final class PetView: NSView {
         bannerActionTty = actionTty               // 记下对应终端 tty,点横幅时优先按它精确回窗口
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        // 高度自适应:按文案在固定宽度下换行所需高度撑高横幅,底边贴星芒上方向上长
-        let hPad: CGFloat = 12, vPad: CGFloat = 7
-        let innerW = Style.bannerWidth - hPad * 2
-        let font = NSFont.systemFont(ofSize: 13, weight: .semibold)
-        let maxInnerH = Style.bannerMaxHeight - vPad * 2
-        let textRect = (message as NSString).boundingRect(
-            with: CGSize(width: innerW, height: maxInnerH),
-            options: [.usesLineFragmentOrigin, .usesFontLeading],
-            attributes: [.font: font])
-        let innerH = min(ceil(textRect.height), maxInnerH)
-        let bannerH = max(Style.bannerMinHeight, innerH + vPad * 2)
+        let bannerH = Self.pixelTitleBannerHeight(for: message, width: Style.bannerWidth)
         bannerLayer.frame = CGRect(x: (bounds.width - Style.bannerWidth) / 2,
                                    y: Style.windowSize + Style.bannerGap,
                                    width: Style.bannerWidth, height: bannerH)
-        bannerTextLayer.frame = CGRect(x: hPad, y: vPad, width: innerW, height: bannerH - vPad * 2)
-        bannerTextLayer.string = message
-        bannerLayer.borderColor = accent.cgColor   // 边框色随通知类型(微信绿 / 任务橙)
+        bannerBackdropLayer.frame = bannerLayer.bounds
+        let backdrop = Self.pixelTitleBannerImage(size: bannerLayer.bounds.size, accent: accent, message: message)
+        bannerBackdropLayer.contents = backdrop.cgImage(forProposedRect: nil, context: nil, hints: nil)
         bannerLayer.opacity = 1
         bannerLayer.transform = CATransform3DIdentity
         CATransaction.commit()
@@ -956,6 +944,176 @@ final class PetView: NSView {
         }
         RunLoop.main.add(hide, forMode: .common)
         bannerHideTimer = hide
+    }
+
+    /// 高度自适应:按像素文字在固定宽度下换行所需高度撑高横幅,底边贴星芒上方向上长。
+    static func pixelTitleBannerHeight(for message: String, width: CGFloat) -> CGFloat {
+        let renderScale: CGFloat = 1.0
+        let hPad: CGFloat = 30
+        let vPad: CGFloat = 7
+        let decorationReserve: CGFloat = 96
+        let textWidth = width - hPad * 2 - decorationReserve
+        let maxInnerH = Style.bannerMaxHeight - vPad * 2
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byWordWrapping
+        let font = NSFont.monospacedSystemFont(ofSize: max(10, 12 * renderScale), weight: .bold)
+        let textRect = (message as NSString).boundingRect(
+            with: CGSize(width: textWidth, height: maxInnerH),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: font, .paragraphStyle: paragraph])
+        let innerH = min(ceil(textRect.height), maxInnerH)
+        guard pixelTitleBannerBackground != nil else {
+            return max(Style.bannerMinHeight, innerH + vPad * 2)
+        }
+        return min(Style.bannerMaxHeight, max(Style.bannerMinHeight, floor(width * 0.26)))
+    }
+
+    /// 第 5 款“像素游戏标题栏”横幅。文字关闭抗锯齿并由图层最近邻显示,保留像素硬边且保证中文可读。
+    static func pixelTitleBannerImage(size: CGSize, accent: NSColor, message: String? = nil) -> NSImage {
+        let renderScale: CGFloat = 1.0
+        let pixelSize = CGSize(width: max(1, floor(size.width * renderScale)),
+                               height: max(1, floor(size.height * renderScale)))
+        let image = NSImage(size: pixelSize)
+        image.lockFocus()
+        defer { image.unlockFocus() }
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return image }
+
+        ctx.interpolationQuality = .none
+        ctx.setShouldAntialias(false)
+
+        let rect = CGRect(origin: .zero, size: pixelSize)
+        let cream = NSColor(srgbRed: 0xFF / 255.0, green: 0xF1 / 255.0, blue: 0xDA / 255.0, alpha: 1)
+        let pixel = max(2, floor(min(pixelSize.width, pixelSize.height) / 18))
+
+        func fill(_ r: CGRect, _ color: NSColor) {
+            ctx.setFillColor(color.cgColor)
+            ctx.fill(r.integral)
+        }
+        func strokePixel(_ r: CGRect, width: CGFloat, color: NSColor) {
+            fill(CGRect(x: r.minX, y: r.minY, width: r.width, height: width), color)
+            fill(CGRect(x: r.minX, y: r.maxY - width, width: r.width, height: width), color)
+            fill(CGRect(x: r.minX, y: r.minY, width: width, height: r.height), color)
+            fill(CGRect(x: r.maxX - width, y: r.minY, width: width, height: r.height), color)
+        }
+
+        if let source = pixelTitleBannerBackground {
+            NSGraphicsContext.current?.imageInterpolation = .none
+            let sourceRect = CGRect(x: source.size.width * 0.075,
+                                    y: source.size.height * 0.19,
+                                    width: source.size.width * 0.85,
+                                    height: source.size.height * 0.62)
+            source.draw(in: rect, from: sourceRect, operation: .sourceOver, fraction: 1)
+            let messagePanel = CGRect(x: pixelSize.width * 0.06,
+                                      y: pixelSize.height * 0.18,
+                                      width: pixelSize.width * 0.61,
+                                      height: pixelSize.height * 0.67).integral
+            fill(messagePanel, NSColor(srgbRed: 0x13 / 255.0, green: 0x14 / 255.0, blue: 0x1D / 255.0, alpha: 1.0))
+        } else {
+            let dark = NSColor(srgbRed: 0x23 / 255.0, green: 0x1C / 255.0, blue: 0x2C / 255.0, alpha: 0.98)
+            let stripe = NSColor(srgbRed: 0x2E / 255.0, green: 0x23 / 255.0, blue: 0x3A / 255.0, alpha: 0.98)
+            let panel = NSColor(srgbRed: 0x16 / 255.0, green: 0x17 / 255.0, blue: 0x22 / 255.0, alpha: 0.96)
+            let accentColor = accent.usingColorSpace(.sRGB) ?? accent
+
+            ctx.setFillColor(dark.cgColor)
+            ctx.fill(rect)
+            ctx.setFillColor(stripe.cgColor)
+            var y: CGFloat = 0
+            while y < pixelSize.height {
+                ctx.fill(CGRect(x: 0, y: y, width: pixelSize.width, height: pixel))
+                y += pixel * 3
+            }
+
+            strokePixel(rect.insetBy(dx: pixel * 2, dy: pixel * 2), width: pixel * 2, color: cream)
+            strokePixel(rect.insetBy(dx: pixel * 4, dy: pixel * 4), width: pixel, color: accentColor)
+
+            let panelRect = rect.insetBy(dx: pixel * 7, dy: pixel * 6)
+            if panelRect.width > pixel * 18, panelRect.height > pixel * 6 {
+                fill(panelRect, panel)
+                fill(CGRect(x: panelRect.minX, y: panelRect.maxY - pixel, width: panelRect.width, height: pixel), accentColor)
+            }
+
+            if pixelSize.height >= 21 {
+                let starX = rect.maxX - pixel * 10
+                let starY = rect.midY
+                fill(CGRect(x: starX - pixel * 2, y: starY - pixel, width: pixel * 4, height: pixel * 2), cream)
+                fill(CGRect(x: starX - pixel, y: starY - pixel * 2, width: pixel * 2, height: pixel * 4), cream)
+                fill(CGRect(x: starX - pixel * 4, y: starY, width: pixel, height: pixel), accentColor)
+                fill(CGRect(x: starX + pixel * 3, y: starY, width: pixel, height: pixel), accentColor)
+                fill(CGRect(x: starX, y: starY - pixel * 4, width: pixel, height: pixel), accentColor)
+                fill(CGRect(x: starX, y: starY + pixel * 3, width: pixel, height: pixel), accentColor)
+            }
+
+            fill(CGRect(x: rect.minX + pixel * 6, y: rect.minY + pixel * 4, width: pixel * 2, height: pixel * 2), accentColor)
+            fill(CGRect(x: rect.maxX - pixel * 8, y: rect.maxY - pixel * 6, width: pixel * 2, height: pixel * 2), accentColor)
+        }
+
+        if let message, !message.isEmpty {
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.alignment = .center
+            paragraph.lineBreakMode = .byWordWrapping
+            let font = NSFont.monospacedSystemFont(ofSize: max(10, 12 * renderScale), weight: .bold)
+            let textAttributes: [NSAttributedString.Key: Any] = [
+                .font: font,
+                .foregroundColor: cream,
+                .paragraphStyle: paragraph
+            ]
+            let usesImageBackground = pixelTitleBannerBackground != nil
+            let textX = usesImageBackground ? pixelSize.width * 0.10 : 15 * renderScale
+            let textWidth = usesImageBackground ? pixelSize.width * 0.56 : pixelSize.width - (52 * renderScale)
+            let maxTextSize = CGSize(width: textWidth,
+                                     height: usesImageBackground ? pixelSize.height * 0.22 : pixelSize.height - (18 * renderScale))
+            let measured = (message as NSString).boundingRect(
+                with: maxTextSize,
+                options: [.usesLineFragmentOrigin, .usesFontLeading],
+                attributes: textAttributes
+            )
+            let textRect = CGRect(x: textX,
+                                  y: usesImageBackground
+                                    ? pixelSize.height * 0.39 + (maxTextSize.height - min(ceil(measured.height), maxTextSize.height)) / 2
+                                    : max(9 * renderScale, (pixelSize.height - min(ceil(measured.height), maxTextSize.height)) / 2 - 1),
+                                  width: maxTextSize.width,
+                                  height: min(ceil(measured.height) + 2, maxTextSize.height)).integral
+            if usesImageBackground {
+                let labelAttributes: [NSAttributedString.Key: Any] = [
+                    .font: NSFont.monospacedSystemFont(ofSize: max(6, 7 * renderScale), weight: .heavy),
+                    .foregroundColor: NSColor(srgbRed: 0xFF / 255.0, green: 0xC8 / 255.0, blue: 0x44 / 255.0, alpha: 1),
+                    .paragraphStyle: paragraph
+                ]
+                let labelRect = CGRect(x: pixelSize.width * 0.10,
+                                       y: pixelSize.height * 0.66,
+                                       width: pixelSize.width * 0.56,
+                                       height: pixelSize.height * 0.10).integral
+                ("STAR PET" as NSString).draw(with: labelRect,
+                                              options: [.usesLineFragmentOrigin, .usesFontLeading, .truncatesLastVisibleLine],
+                                              attributes: labelAttributes)
+                let startAttributes: [NSAttributedString.Key: Any] = [
+                    .font: NSFont.monospacedSystemFont(ofSize: max(6, 8 * renderScale), weight: .bold),
+                    .foregroundColor: NSColor(srgbRed: 0x63 / 255.0, green: 0xD8 / 255.0, blue: 0xF5 / 255.0, alpha: 1),
+                    .paragraphStyle: paragraph
+                ]
+                let startRect = CGRect(x: pixelSize.width * 0.10,
+                                       y: pixelSize.height * 0.26,
+                                       width: pixelSize.width * 0.56,
+                                       height: pixelSize.height * 0.11).integral
+                ("PRESS START" as NSString).draw(with: startRect,
+                                                 options: [.usesLineFragmentOrigin, .usesFontLeading, .truncatesLastVisibleLine],
+                                                 attributes: startAttributes)
+            }
+            let shadowAttributes: [NSAttributedString.Key: Any] = [
+                .font: font,
+                .foregroundColor: NSColor.black.withAlphaComponent(0.65),
+                .paragraphStyle: paragraph
+            ]
+            for offset in [CGPoint(x: 1, y: 0), CGPoint(x: -1, y: 0), CGPoint(x: 0, y: 1), CGPoint(x: 0, y: -1)] {
+                (message as NSString).draw(with: textRect.offsetBy(dx: offset.x, dy: offset.y),
+                                           options: [.usesLineFragmentOrigin, .usesFontLeading, .truncatesLastVisibleLine],
+                                           attributes: shadowAttributes)
+            }
+            (message as NSString).draw(with: textRect,
+                                       options: [.usesLineFragmentOrigin, .usesFontLeading, .truncatesLastVisibleLine],
+                                       attributes: textAttributes)
+        }
+        return image
     }
 
     private func logWeChatAccessibilityFailure(_ message: String) {
@@ -2115,7 +2273,7 @@ final class PetView: NSView {
     // MARK: 星星图标渲染
     /// 把 starArt 的方块字符逐个按 2×2 象限自绘成星芒:不走字体、直接填充矩形,
     /// 故无字体拼接缝隙,能严丝合缝还原终端里的样子;cell 取瘦高比例,呼应终端字符格。
-    private static func starImage(size: CGSize, mouthOpen: CGFloat = 0, eyeLook: CGVector = CGVector(dx: 0, dy: 0), eyeMode: EyeMode = .normal, runPhase: Int = 0) -> NSImage {
+    fileprivate static func starImage(size: CGSize, mouthOpen: CGFloat = 0, eyeLook: CGVector = CGVector(dx: 0, dy: 0), eyeMode: EyeMode = .normal, runPhase: Int = 0) -> NSImage {
         let image = NSImage(size: size)
         image.lockFocus()
         defer { image.unlockFocus() }
@@ -3611,6 +3769,48 @@ private func renderSnapshot(to path: String, mouthOpen: CGFloat = 0, eyeLook: CG
     }
 }
 
+@MainActor
+private func renderBannerPreview(to path: String, message: String) {
+    let size = CGSize(width: 380, height: 230)
+    let petDim: CGFloat = 112
+    let petImage = PetView.starImage(size: CGSize(width: petDim, height: petDim), eyeMode: .happy)
+
+    let image = NSImage(size: size)
+    image.lockFocus()
+    guard let ctx = NSGraphicsContext.current?.cgContext else {
+        image.unlockFocus()
+        FileHandle.standardError.write(Data("渲染失败\n".utf8))
+        exit(1)
+    }
+
+    ctx.setFillColor(NSColor(srgbRed: 0x1E / 255.0, green: 0x1E / 255.0, blue: 0x1E / 255.0, alpha: 1).cgColor)
+    ctx.fill(CGRect(origin: .zero, size: size))
+
+    let bannerHeight = PetView.pixelTitleBannerHeight(for: message, width: Style.bannerWidth)
+    let bannerSize = CGSize(width: Style.bannerWidth, height: bannerHeight)
+    let bannerRect = CGRect(x: (size.width - bannerSize.width) / 2, y: 140, width: bannerSize.width, height: bannerSize.height)
+    let banner = PetView.pixelTitleBannerImage(size: bannerSize, accent: Settings.defaultPetColor, message: message)
+    NSGraphicsContext.current?.imageInterpolation = .none
+    banner.draw(in: bannerRect, from: .zero, operation: .sourceOver, fraction: 1)
+
+    petImage.draw(in: CGRect(x: (size.width - petDim) / 2, y: 30, width: petDim, height: petDim), from: .zero, operation: .sourceOver, fraction: 1)
+    image.unlockFocus()
+
+    guard let tiff = image.tiffRepresentation,
+          let rep = NSBitmapImageRep(data: tiff),
+          let png = rep.representation(using: .png, properties: [:]) else {
+        FileHandle.standardError.write(Data("渲染失败\n".utf8))
+        exit(1)
+    }
+    do {
+        try png.write(to: URL(fileURLWithPath: path))
+        print("已输出横幅预览:\(path)")
+    } catch {
+        FileHandle.standardError.write(Data("写入失败:\(error)\n".utf8))
+        exit(1)
+    }
+}
+
 // MARK: - 入口
 // 程序启动即处于主线程,assumeIsolated 让顶层安全进入主 actor 上下文。
 
@@ -3721,6 +3921,14 @@ MainActor.assumeIsolated {
         let r = idx + 2 < arguments.count ? Int(arguments[idx + 2]) ?? 1 : 1
         let w = idx + 3 < arguments.count ? Int(arguments[idx + 3]) ?? 0 : 0
         renderSnapshot(to: out, badgeRunning: r, badgeWaiting: w)
+        exit(0)
+    }
+
+    if let idx = arguments.firstIndex(of: "--render-banner") {
+        // 自测模式:渲染第 5 款像素游戏标题栏横幅;用法:--render-banner [out.png] [文案]
+        let out = idx + 1 < arguments.count ? arguments[idx + 1] : "/tmp/agentpet-banner.png"
+        let message = idx + 2 < arguments.count ? arguments[idx + 2] : "cc · 任务完成"
+        renderBannerPreview(to: out, message: message)
         exit(0)
     }
 
