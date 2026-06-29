@@ -3037,21 +3037,33 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
                                   maxValue: Settings.maxPounceDuration,
                                   target: nil,
                                   action: nil)
+    private let contentWidth: CGFloat = 500
+    private let contentHeight: CGFloat = 952
+    private let visibleHeight: CGFloat = 700
+    private let horizontalMargin: CGFloat = 24
+    private let fieldWidth: CGFloat = 452
 
     init() {
-        let content = NSView(frame: NSRect(x: 0, y: 0, width: 360, height: 952))
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: contentWidth, height: contentHeight))
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: contentWidth, height: visibleHeight))
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = false
+        scroll.borderType = .noBorder
+        scroll.documentView = content
         let window = NSWindow(
-            contentRect: content.frame,
+            contentRect: scroll.frame,
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
         )
         window.title = "AgentPet 设置"
         window.isReleasedWhenClosed = false
-        window.contentView = content
+        window.contentView = scroll
         super.init(window: window)
         window.delegate = self
         buildContent(in: content)
+        scroll.contentView.scroll(to: NSPoint(x: 0, y: contentHeight - visibleHeight))
+        scroll.reflectScrolledClipView(scroll.contentView)
         updateValueLabel()
         colorWell.color = Settings.petColor
         updateColorControls()
@@ -3073,7 +3085,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             let label = NSTextField(labelWithString: text)
             label.font = .systemFont(ofSize: 13, weight: .bold)
             label.textColor = .secondaryLabelColor
-            label.frame = NSRect(x: 24, y: y, width: 312, height: 18)
+            label.frame = NSRect(x: horizontalMargin, y: y, width: fieldWidth, height: 18)
             content.addSubview(label)
         }
 
@@ -3081,14 +3093,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         section("任务监控", y: 920)
         monitorButton.target = self
         monitorButton.action = #selector(monitorChanged(_:))
-        monitorButton.frame = NSRect(x: 24, y: 892, width: 300, height: 24)
+        monitorButton.frame = NSRect(x: horizontalMargin, y: 892, width: 360, height: 24)
         content.addSubview(monitorButton)
         let openMonitorButton = NSButton(title: "打开页面", target: self, action: #selector(openMonitor(_:)))
         openMonitorButton.bezelStyle = .rounded
-        openMonitorButton.frame = NSRect(x: 250, y: 889, width: 86, height: 26)
+        openMonitorButton.frame = NSRect(x: 390, y: 889, width: 86, height: 26)
         content.addSubview(openMonitorButton)
         let portTitle = NSTextField(labelWithString: "端口")
-        portTitle.frame = NSRect(x: 24, y: 862, width: 40, height: 22)
+        portTitle.frame = NSRect(x: horizontalMargin, y: 862, width: 40, height: 22)
         content.addSubview(portTitle)
         monitorPortField.target = self
         monitorPortField.action = #selector(monitorPortChanged(_:))
@@ -3098,114 +3110,114 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         monitorNoteLabel.font = .systemFont(ofSize: 11)
         monitorNoteLabel.textColor = .secondaryLabelColor
         monitorNoteLabel.lineBreakMode = .byTruncatingTail
-        monitorNoteLabel.frame = NSRect(x: 140, y: 862, width: 196, height: 22)
+        monitorNoteLabel.frame = NSRect(x: 140, y: 862, width: 336, height: 22)
         content.addSubview(monitorNoteLabel)
 
         // —— 权限(系统授权需手动开;app 无法自授权,这里只显示状态 + 一键带你去开)——
         section("权限", y: 828)
         let fdaName = NSTextField(labelWithString: "完全磁盘访问")
-        fdaName.frame = NSRect(x: 24, y: 800, width: 120, height: 22)
+        fdaName.frame = NSRect(x: horizontalMargin, y: 800, width: 120, height: 22)
         content.addSubview(fdaName)
         fdaStatusLabel.alignment = .right
-        fdaStatusLabel.frame = NSRect(x: 146, y: 800, width: 96, height: 22)
+        fdaStatusLabel.frame = NSRect(x: 286, y: 800, width: 96, height: 22)
         content.addSubview(fdaStatusLabel)
         let fdaButton = NSButton(title: "去开启…", target: self, action: #selector(openFullDiskAccess(_:)))
         fdaButton.bezelStyle = .rounded
-        fdaButton.frame = NSRect(x: 250, y: 797, width: 86, height: 26)
+        fdaButton.frame = NSRect(x: 390, y: 797, width: 86, height: 26)
         content.addSubview(fdaButton)
 
         let axName = NSTextField(labelWithString: "辅助功能")
-        axName.frame = NSRect(x: 24, y: 772, width: 120, height: 22)
+        axName.frame = NSRect(x: horizontalMargin, y: 772, width: 120, height: 22)
         content.addSubview(axName)
         axStatusLabel.alignment = .right
-        axStatusLabel.frame = NSRect(x: 146, y: 772, width: 96, height: 22)
+        axStatusLabel.frame = NSRect(x: 286, y: 772, width: 96, height: 22)
         content.addSubview(axStatusLabel)
         let axButton = NSButton(title: "去开启…", target: self, action: #selector(openAccessibilitySettings(_:)))
         axButton.bezelStyle = .rounded
-        axButton.frame = NSRect(x: 250, y: 769, width: 86, height: 26)
+        axButton.frame = NSRect(x: 390, y: 769, width: 86, height: 26)
         content.addSubview(axButton)
 
         let autoNote = NSTextField(labelWithString: "自动化(控制 Finder/终端)首次用到时弹窗,点允许即可")
         autoNote.font = .systemFont(ofSize: 11)
         autoNote.textColor = .secondaryLabelColor
-        autoNote.frame = NSRect(x: 24, y: 748, width: 312, height: 16)
+        autoNote.frame = NSRect(x: horizontalMargin, y: 748, width: fieldWidth, height: 16)
         content.addSubview(autoNote)
 
         // —— 划词翻译 ——
         section("划词翻译", y: 716)
         translateButton.target = self
         translateButton.action = #selector(translateChanged(_:))
-        translateButton.frame = NSRect(x: 24, y: 688, width: 300, height: 24)
+        translateButton.frame = NSRect(x: horizontalMargin, y: 688, width: 360, height: 24)
         content.addSubview(translateButton)
 
         // —— 互动 ——
         section("互动", y: 648)
         let speedTitle = NSTextField(labelWithString: "移动速度")
-        speedTitle.frame = NSRect(x: 24, y: 618, width: 120, height: 22)
+        speedTitle.frame = NSRect(x: horizontalMargin, y: 618, width: 120, height: 22)
         content.addSubview(speedTitle)
         valueLabel.alignment = .right
-        valueLabel.frame = NSRect(x: 200, y: 618, width: 136, height: 22)
+        valueLabel.frame = NSRect(x: 340, y: 618, width: 136, height: 22)
         content.addSubview(valueLabel)
 
         slider.target = self
         slider.action = #selector(sliderChanged(_:))
         slider.numberOfTickMarks = 6
         slider.allowsTickMarkValuesOnly = false
-        slider.frame = NSRect(x: 24, y: 592, width: 312, height: 24)
+        slider.frame = NSRect(x: horizontalMargin, y: 592, width: fieldWidth, height: 24)
         content.addSubview(slider)
 
         let fast = NSTextField(labelWithString: "快")
         fast.textColor = .secondaryLabelColor
-        fast.frame = NSRect(x: 24, y: 570, width: 40, height: 18)
+        fast.frame = NSRect(x: horizontalMargin, y: 570, width: 40, height: 18)
         content.addSubview(fast)
         let slow = NSTextField(labelWithString: "慢")
         slow.textColor = .secondaryLabelColor
         slow.alignment = .right
-        slow.frame = NSRect(x: 296, y: 570, width: 40, height: 18)
+        slow.frame = NSRect(x: 436, y: 570, width: 40, height: 18)
         content.addSubview(slow)
 
         colorTitle.font = .systemFont(ofSize: 13, weight: .regular)
-        colorTitle.frame = NSRect(x: 24, y: 540, width: 120, height: 22)
+        colorTitle.frame = NSRect(x: horizontalMargin, y: 540, width: 120, height: 22)
         content.addSubview(colorTitle)
         colorWell.target = self
         colorWell.action = #selector(colorChanged(_:))
-        colorWell.frame = NSRect(x: 288, y: 536, width: 48, height: 30)
+        colorWell.frame = NSRect(x: 428, y: 536, width: 48, height: 30)
         content.addSubview(colorWell)
 
         autoAdaptButton.target = self
         autoAdaptButton.action = #selector(autoAdaptChanged(_:))
-        autoAdaptButton.frame = NSRect(x: 24, y: 506, width: 220, height: 24)
+        autoAdaptButton.frame = NSRect(x: horizontalMargin, y: 506, width: 220, height: 24)
         content.addSubview(autoAdaptButton)
 
         // —— 陪跑(Claude Code / Codex)——
         section("陪跑(Claude Code / Codex)", y: 472)
         focusOnStartButton.target = self
         focusOnStartButton.action = #selector(focusOnStartChanged(_:))
-        focusOnStartButton.frame = NSRect(x: 24, y: 444, width: 220, height: 24)
+        focusOnStartButton.frame = NSRect(x: horizontalMargin, y: 444, width: 220, height: 24)
         content.addSubview(focusOnStartButton)
         notifyOnWaitingButton.target = self
         notifyOnWaitingButton.action = #selector(notifyOnWaitingChanged(_:))
-        notifyOnWaitingButton.frame = NSRect(x: 24, y: 418, width: 240, height: 24)
+        notifyOnWaitingButton.frame = NSRect(x: horizontalMargin, y: 418, width: 240, height: 24)
         content.addSubview(notifyOnWaitingButton)
         taskDoneNotificationsButton.target = self
         taskDoneNotificationsButton.action = #selector(taskDoneNotificationsChanged(_:))
-        taskDoneNotificationsButton.frame = NSRect(x: 24, y: 392, width: 220, height: 24)
+        taskDoneNotificationsButton.frame = NSRect(x: horizontalMargin, y: 392, width: 220, height: 24)
         content.addSubview(taskDoneNotificationsButton)
         showSessionBadgeButton.target = self
         showSessionBadgeButton.action = #selector(showSessionBadgeChanged(_:))
-        showSessionBadgeButton.frame = NSRect(x: 24, y: 366, width: 260, height: 24)
+        showSessionBadgeButton.frame = NSRect(x: horizontalMargin, y: 366, width: 360, height: 24)
         content.addSubview(showSessionBadgeButton)
 
         // —— 作息脾气 ——
         section("作息脾气", y: 332)
         moodDecayButton.target = self
         moodDecayButton.action = #selector(moodDecayChanged(_:))
-        moodDecayButton.frame = NSRect(x: 24, y: 304, width: 160, height: 24)
+        moodDecayButton.frame = NSRect(x: horizontalMargin, y: 304, width: 160, height: 24)
         content.addSubview(moodDecayButton)
 
         sedentaryButton.target = self
         sedentaryButton.action = #selector(sedentaryChanged(_:))
-        sedentaryButton.frame = NSRect(x: 24, y: 278, width: 110, height: 24)
+        sedentaryButton.frame = NSRect(x: horizontalMargin, y: 278, width: 110, height: 24)
         content.addSubview(sedentaryButton)
         sedentaryStepper.target = self
         sedentaryStepper.action = #selector(sedentaryStepperChanged(_:))
@@ -3221,14 +3233,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
         nightDrowsyButton.target = self
         nightDrowsyButton.action = #selector(nightDrowsyChanged(_:))
-        nightDrowsyButton.frame = NSRect(x: 24, y: 252, width: 160, height: 24)
+        nightDrowsyButton.frame = NSRect(x: horizontalMargin, y: 252, width: 160, height: 24)
         content.addSubview(nightDrowsyButton)
 
         // —— 通知 ——
         section("通知", y: 218)
         weChatNotificationsButton.target = self
         weChatNotificationsButton.action = #selector(weChatNotificationsChanged(_:))
-        weChatNotificationsButton.frame = NSRect(x: 24, y: 190, width: 130, height: 24)
+        weChatNotificationsButton.frame = NSRect(x: horizontalMargin, y: 190, width: 130, height: 24)
         content.addSubview(weChatNotificationsButton)
         larkNotificationsButton.target = self
         larkNotificationsButton.action = #selector(larkNotificationsChanged(_:))
@@ -3236,13 +3248,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         content.addSubview(larkNotificationsButton)
         doNotDisturbButton.target = self
         doNotDisturbButton.action = #selector(doNotDisturbChanged(_:))
-        doNotDisturbButton.frame = NSRect(x: 24, y: 164, width: 260, height: 24)
+        doNotDisturbButton.frame = NSRect(x: horizontalMargin, y: 164, width: 260, height: 24)
         content.addSubview(doNotDisturbButton)
 
         // —— 窗口 ——
         section("窗口", y: 130)
         let dockTitle = NSTextField(labelWithString: "停靠")
-        dockTitle.frame = NSRect(x: 24, y: 100, width: 50, height: 22)
+        dockTitle.frame = NSRect(x: horizontalMargin, y: 100, width: 50, height: 22)
         content.addSubview(dockTitle)
         dockCornerPopup.target = self
         dockCornerPopup.action = #selector(dockCornerChanged(_:))
@@ -3252,12 +3264,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
         launchAtLoginButton.target = self
         launchAtLoginButton.action = #selector(launchAtLoginChanged(_:))
-        launchAtLoginButton.frame = NSRect(x: 24, y: 66, width: 200, height: 24)
+        launchAtLoginButton.frame = NSRect(x: horizontalMargin, y: 66, width: 200, height: 24)
         content.addSubview(launchAtLoginButton)
 
         let close = NSButton(title: "关闭", target: self, action: #selector(closeWindow(_:)))
         close.bezelStyle = .rounded
-        close.frame = NSRect(x: 258, y: 18, width: 78, height: 28)
+        close.frame = NSRect(x: 398, y: 18, width: 78, height: 28)
         content.addSubview(close)
     }
 
