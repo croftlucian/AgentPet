@@ -432,7 +432,7 @@ final class PetView: NSView {
     /// 单个陪跑会话状态:最近事件时间(供超时兜底)、是否在等主公(waiting 置位,驱动角标"等N")、承载会话的进程 pid(供 kill -0 探活)。
     struct SessionInfo { var at: Date; var waiting: Bool; var pid: pid_t? = nil }
     /// 每个 sid 已处理事件的最新"生成时间戳"(epoch 秒,由 hook 注入 ts 参数)。
-    /// hook 每个事件都是 `open agentpet://` 一发即走,LaunchServices 不保证按发出顺序投递;sid 又在整段对话里复用——
+    /// hook 每个事件都是 `open -g agentpet://` 后台一发即走,LaunchServices 不保证按发出顺序投递;sid 又在整段对话里复用——
     /// 上一轮迟到的 done 会误删刚开跑的新轮(「跑」丢)、上一轮迟到的尾随 waiting 会把新轮误标「等」(「等」错)。
     /// 据此按 ts 定序:同一 sid 收到比已处理更旧的事件一律丢弃,一并治住「跑」「等」两类错标,无需任何时间宽限窗猜测。
     private var lastEventAt: [String: Double] = [:]
@@ -3548,6 +3548,12 @@ enum ShellAliasInstaller {
 }
 
 @MainActor
+final class PetWindow: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+}
+
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow!
     private weak var petView: PetView?
@@ -3564,12 +3570,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 默认停在用户选定的角(缺省右下);origin 计算收敛进 DockCorner
         let origin = DockCorner.current.origin(in: screen, size: appSize)
 
-        let win = NSWindow(
+        let win = PetWindow(
             contentRect: NSRect(origin: origin, size: appSize),
-            styleMask: .borderless,
+            styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
+        win.hidesOnDeactivate = false
         win.isOpaque = false
         win.backgroundColor = .clear
         // 刻意不用窗口级 hasShadow:它由系统按窗口位图生成,不跟随图层 transform 动画刷新,
@@ -3581,7 +3588,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         win.isMovableByWindowBackground = true // 整窗可拖拽
         let petView = PetView(frame: NSRect(origin: .zero, size: appSize))
         win.contentView = petView
-        win.makeKeyAndOrderFront(nil)
+        win.orderFrontRegardless()
         window = win
         self.petView = petView
 
@@ -3660,8 +3667,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    // MARK: 任务完成通知:外部 CLI 完成后 open "agentpet://done?tool=...&cwd=..." 唤起报喜横幅
-    // Claude Code 的 Stop 钩子 / Codex 的 notify 各自落到一条 open 命令;Info.plist 已声明 agentpet 协议,
+    // MARK: 任务完成通知:外部 CLI 完成后 open -g "agentpet://done?tool=...&cwd=..." 后台唤起报喜横幅
+    // Claude Code 的 Stop 钩子 / Codex 的 notify 各自落到一条后台 open 命令;Info.plist 已声明 agentpet 协议,
     // 系统据此把 GetURL 事件转给下方回调。只读 URL 参数、弹横幅,不碰任何文件。
     func application(_ application: NSApplication, open urls: [URL]) {
         for url in urls where url.scheme == "agentpet" {

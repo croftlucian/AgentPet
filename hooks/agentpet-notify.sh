@@ -1,9 +1,9 @@
 #!/bin/bash
 # AgentPet 生命周期通知转发器
 # 把 Claude Code / Codex 的生命周期事件,转成一次
-#     open "agentpet://<phase>?tool=<claude|codex>&sid=<会话>&cwd=<目录>&task=<简介>&tty=<终端设备>&ts=<事件时间戳>&pid=<会话进程pid>"
+#     open -g "agentpet://<phase>?tool=<claude|codex>&sid=<会话>&cwd=<目录>&task=<简介>&tty=<终端设备>&ts=<事件时间戳>&pid=<会话进程pid>"
 # 唤起桌宠陪跑:开工(start)进专注态、等确认(waiting)弹横幅提醒、收工(done)庆祝。
-# 只读事件与会话记录、只 open 一个自定义 URL,绝不改动任何文件。
+# 只读事件与会话记录、后台 open 一个自定义 URL,绝不改动任何文件,也不抢主公当前输入焦点。
 #
 # 用法(第 2 个参数是 phase,取值 start|waiting|done,缺省 done):
 #   Claude Code —— ~/.claude/settings.json 各钩子(事件 JSON 从 stdin 传入):
@@ -194,5 +194,5 @@ if [ -n "${AGENTPET_NOTIFY_DRYRUN:-}" ]; then
   exit 0
 fi
 
-/usr/bin/open "$url"
+/usr/bin/open -g "$url"
 exit 0

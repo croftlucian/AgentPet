@@ -56,7 +56,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <true/>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
-    <!-- 自定义 URL 协议:Claude Code / Codex 完成任务后 open "agentpet://done?..." 唤起桌宠报喜 -->
+    <!-- 自定义 URL 协议:Claude Code / Codex 完成任务后 open -g "agentpet://done?..." 后台唤起桌宠报喜 -->
     <key>CFBundleURLTypes</key>
     <array>
         <dict>
