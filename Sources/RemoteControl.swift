@@ -28,9 +28,10 @@ final class ChatContext {
     private var _sessionID: String?
     private var _busy = false
 
-    init(tool: FeedTool, cwd: String, label: String) {
+    init(tool: FeedTool, cwd: String, label: String, sessionID: String? = nil) {
         self.tool = tool
         self._cwd = cwd
+        self._sessionID = sessionID
         self.queue = DispatchQueue(label: label)
     }
 
@@ -54,10 +55,126 @@ final class ChatContext {
     func end() { lock.lock(); _busy = false; lock.unlock() }
 }
 
+struct RemoteSessionRecord: Codable {
+    var platform: String
+    var remoteUserID: String
+    var botID: String
+    var cwd: String
+    var sessionID: String?
+    var recentFileTaskID: String?
+    var createdAt: Double
+    var updatedAt: Double
+}
+
+/// 远程会话持久化:AgentPet 重启后,同一个 Telegram/飞书用户仍能接着上一次 cc/cx 会话继续聊。
+/// 键粒度为 平台 + 用户 + Bot,与个性化配置隔离方式一致;文件很小,整文件读写即可。
+enum RemoteSessionStore {
+    private struct Database: Codable { var records: [String: RemoteSessionRecord] = [:] }
+
+    private static let queue = DispatchQueue(label: "agentpet.remote.session.store")
+    static var overridePathForTesting: String?
+
+    static var filePath: String {
+        overridePathForTesting ?? (RemoteBotProfileStore.dataDirectory + "/remote-sessions.json")
+    }
+
+    static func key(platform: String, remoteUserID: String, botID: String) -> String {
+        [platform, remoteUserID, botID].joined(separator: "|")
+    }
+
+    static func record(platform: String, remoteUserID: String, botID: String) -> RemoteSessionRecord? {
+        queue.sync { load().records[key(platform: platform, remoteUserID: remoteUserID, botID: botID)] }
+    }
+
+    static func allRecords() -> [RemoteSessionRecord] {
+        queue.sync {
+            load().records.values.sorted {
+                ($0.platform, $0.remoteUserID, $0.botID) < ($1.platform, $1.remoteUserID, $1.botID)
+            }
+        }
+    }
+
+    @discardableResult
+    static func update(platform: String, remoteUserID: String, botID: String,
+                       _ mutate: (inout RemoteSessionRecord) -> Void) -> RemoteSessionRecord {
+        queue.sync {
+            var db = load()
+            let k = key(platform: platform, remoteUserID: remoteUserID, botID: botID)
+            var rec = db.records[k] ?? RemoteSessionRecord(platform: platform, remoteUserID: remoteUserID, botID: botID,
+                                                           cwd: FileManager.default.homeDirectoryForCurrentUser.path,
+                                                           sessionID: nil, recentFileTaskID: nil,
+                                                           createdAt: Date().timeIntervalSince1970,
+                                                           updatedAt: Date().timeIntervalSince1970)
+            mutate(&rec)
+            rec.updatedAt = Date().timeIntervalSince1970
+            db.records[k] = rec
+            save(db)
+            return rec
+        }
+    }
+
+    static func remove(platform: String, remoteUserID: String, botID: String) {
+        queue.sync {
+            var db = load()
+            db.records.removeValue(forKey: key(platform: platform, remoteUserID: remoteUserID, botID: botID))
+            save(db)
+        }
+    }
+
+    static func runSelfTest() -> Bool {
+        let oldPath = overridePathForTesting
+        let tmp = NSTemporaryDirectory() + "agentpet-remote-session-selftest-\(UUID().uuidString).json"
+        overridePathForTesting = tmp
+        defer {
+            overridePathForTesting = oldPath
+            try? FileManager.default.removeItem(atPath: tmp)
+        }
+
+        let p = "telegram", u = "user-a", b = "cx-bot1"
+        update(platform: p, remoteUserID: u, botID: b) {
+            $0.cwd = "/tmp/project"
+            $0.sessionID = "SID-1"
+            $0.recentFileTaskID = "TASK-1"
+        }
+        guard let first = record(platform: p, remoteUserID: u, botID: b),
+              first.cwd == "/tmp/project", first.sessionID == "SID-1",
+              first.recentFileTaskID == "TASK-1" else { return false }
+        update(platform: p, remoteUserID: u, botID: b) {
+            $0.cwd = "/tmp/next"
+            $0.sessionID = nil
+        }
+        guard let second = record(platform: p, remoteUserID: u, botID: b),
+              second.cwd == "/tmp/next", second.sessionID == nil,
+              second.recentFileTaskID == "TASK-1" else { return false }
+        remove(platform: p, remoteUserID: u, botID: b)
+        return record(platform: p, remoteUserID: u, botID: b) == nil
+    }
+
+    private static func load() -> Database {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: filePath)),
+              let db = try? JSONDecoder().decode(Database.self, from: data) else { return Database() }
+        return db
+    }
+
+    private static func save(_ db: Database) {
+        do {
+            try FileManager.default.createDirectory(atPath: (filePath as NSString).deletingLastPathComponent,
+                                                    withIntermediateDirectories: true)
+            let enc = JSONEncoder()
+            enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+            let data = try enc.encode(db)
+            try data.write(to: URL(fileURLWithPath: filePath), options: .atomic)
+        } catch {
+            PetView.log("远程会话状态写入失败:\(error.localizedDescription)")
+        }
+    }
+}
+
 /// 非交互跑 cc/cx:拼命令、起 Process、解析输出。纯同步阻塞,调用方务必放后台线程。
 enum AgentRunner {
     /// 单轮超时(秒):超时即杀进程,回报超时,避免一条卡死的会话把 bot 轮询线程拖住。
     static let timeout: TimeInterval = 600
+    static let remoteCodexHomeName = ".codex-remote"
 
     /// 定位官方 claude / codex 可执行路径(绕过 cc/cx 包装,自己显式加跳过权限参数,参数全可控)。找不到返回 nil。
     static func resolveExecutable(for tool: FeedTool) -> String? {
@@ -90,6 +207,37 @@ enum AgentRunner {
         let raw = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         let path = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         return (path.hasPrefix("/") && FileManager.default.isExecutableFile(atPath: path)) ? path : nil
+    }
+
+    /// 远程遥控的 Codex 使用独立 CODEX_HOME,让远程专用 AGENTS.md 不污染主公本地终端会话。
+    static func remoteCodexHomePath() -> String {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(remoteCodexHomeName).path
+    }
+
+    /// 远程 home 只独立承载 AGENTS.md;认证与模型配置继续复用主 Codex home,避免远程链路重复登录或丢配置。
+    @discardableResult
+    static func prepareRemoteCodexHome() -> String {
+        let fm = FileManager.default
+        let home = fm.homeDirectoryForCurrentUser
+        let source = home.appendingPathComponent(".codex")
+        let remote = home.appendingPathComponent(remoteCodexHomeName)
+        try? fm.createDirectory(at: remote, withIntermediateDirectories: true)
+
+        for name in ["config.toml", "auth.json", "version.json"] {
+            let target = source.appendingPathComponent(name)
+            let link = remote.appendingPathComponent(name)
+            guard fm.fileExists(atPath: target.path), !fm.fileExists(atPath: link.path) else { continue }
+            try? fm.createSymbolicLink(at: link, withDestinationURL: target)
+        }
+        return remote.path
+    }
+
+    static func environment(for tool: FeedTool) -> [String: String] {
+        var environment = ProcessInfo.processInfo.environment
+        if tool == .codex {
+            environment["CODEX_HOME"] = prepareRemoteCodexHome()
+        }
+        return environment
     }
 
     /// 拼非交互命令(纯函数,便于 --telegram-dryrun 离线核对):
@@ -140,6 +288,7 @@ enum AgentRunner {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: exe)
         process.arguments = args
+        process.environment = environment(for: tool)
         process.currentDirectoryURL = URL(fileURLWithPath: cwd)
         process.standardInput = FileHandle.nullDevice   // 无人值守:断开 stdin,免得 codex 卡在"读 stdin"
         let outPipe = Pipe(); let errPipe = Pipe()
@@ -431,6 +580,14 @@ enum RemoteBotProfileStore {
 
     static func record(platform: String, remoteUserID: String, botID: String) -> RemoteBotProfileRecord? {
         queue.sync { load().records[key(platform: platform, remoteUserID: remoteUserID, botID: botID)] }
+    }
+
+    static func allRecords() -> [RemoteBotProfileRecord] {
+        queue.sync {
+            load().records.values.sorted {
+                ($0.platform, $0.remoteUserID, $0.botID) < ($1.platform, $1.remoteUserID, $1.botID)
+            }
+        }
     }
 
     @discardableResult
@@ -1065,6 +1222,22 @@ struct RemoteFileTask {
         return load(root: latestRoot, platform: safePlatform, botID: safeBot, remoteUserID: safeUser)
     }
 
+    static func existing(platform: String, botID: String, remoteUserID: String, taskID: String,
+                         baseDirectory: URL? = nil) -> RemoteFileTask? {
+        let safePlatform = sanitizePathSegment(platform, fallback: "platform")
+        let safeBot = sanitizePathSegment(botID, fallback: "bot")
+        let safeUser = sanitizePathSegment(remoteUserID, fallback: "user")
+        let safeTask = sanitizePathSegment(taskID, fallback: "")
+        guard !safeTask.isEmpty else { return nil }
+        let base = baseDirectory ?? defaultBaseDirectory()
+        let root = base
+            .appendingPathComponent(safePlatform, isDirectory: true)
+            .appendingPathComponent(safeBot, isDirectory: true)
+            .appendingPathComponent(safeUser, isDirectory: true)
+            .appendingPathComponent(safeTask, isDirectory: true)
+        return load(root: root, platform: safePlatform, botID: safeBot, remoteUserID: safeUser)
+    }
+
     static func sanitizePathSegment(_ raw: String, fallback: String) -> String {
         let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
         let cleaned = raw.unicodeScalars.map { allowed.contains($0) ? Character($0) : "_" }
@@ -1533,10 +1706,42 @@ final class TelegramBot {
     private func context(for remoteUserID: String) -> ChatContext {
         if let ctx = contexts[remoteUserID] { return ctx }
         let tag = tool == .codex ? "cx" : "cc"
-        let ctx = ChatContext(tool: tool, cwd: home, label: "agentpet.remote.\(tag).\(ioTagPrefix).\(remoteUserID)")
+        let saved = RemoteSessionStore.record(platform: "telegram", remoteUserID: remoteUserID, botID: ioTagPrefix)
+        let cwd = validDirectory(saved?.cwd) ?? home
+        let ctx = ChatContext(tool: tool, cwd: cwd, label: "agentpet.remote.\(tag).\(ioTagPrefix).\(remoteUserID)",
+                              sessionID: saved?.sessionID)
         contexts[remoteUserID] = ctx
-        PetView.log("Telegram[\(instanceLabel)] 新建会话 user \(remoteUserID),默认目录 \(home)")
+        if let taskID = saved?.recentFileTaskID,
+           let task = RemoteFileTask.existing(platform: "telegram", botID: ioTagPrefix, remoteUserID: remoteUserID, taskID: taskID) {
+            recentFileTasks[remoteUserID] = task
+        }
+        let restored = saved == nil ? "新建" : "恢复"
+        PetView.log("Telegram[\(instanceLabel)] \(restored)会话 user \(remoteUserID),目录 \(cwd),session \(saved?.sessionID == nil ? "无" : "有")")
         return ctx
+    }
+
+    private func validDirectory(_ path: String?) -> String? {
+        guard let path = path, !path.isEmpty else { return nil }
+        var isDir: ObjCBool = false
+        return FileManager.default.fileExists(atPath: path, isDirectory: &isDir) && isDir.boolValue ? path : nil
+    }
+
+    private func persistSession(remoteUserID: String, ctx: ChatContext, sessionID: String? = nil,
+                                recentFileTaskID: String? = nil) {
+        let snap = ctx.snapshot()
+        RemoteSessionStore.update(platform: "telegram", remoteUserID: remoteUserID, botID: ioTagPrefix) {
+            $0.cwd = snap.cwd
+            $0.sessionID = sessionID
+            if let recentFileTaskID { $0.recentFileTaskID = recentFileTaskID }
+        }
+    }
+
+    private func persistRecentFileTask(remoteUserID: String, ctx: ChatContext, taskID: String) {
+        let snap = ctx.snapshot()
+        RemoteSessionStore.update(platform: "telegram", remoteUserID: remoteUserID, botID: ioTagPrefix) {
+            $0.cwd = snap.cwd
+            $0.recentFileTaskID = taskID
+        }
     }
 
     func start() {
@@ -1616,11 +1821,14 @@ final class TelegramBot {
                                      botID: ioTagPrefix, toolLabel: tool.label,
                                      incoming: text) {
         case .reply(let reply, let resetSession):
-            if resetSession { ctx.setSessionID(nil) }
+            if resetSession {
+                ctx.setSessionID(nil)
+                persistSession(remoteUserID: remoteUserID, ctx: ctx, sessionID: nil)
+            }
             sendMessage(chatID: chatID, text: reply)
             return
         case .proceed(let personalizedPrompt):
-            if text.hasPrefix("/") { handleCommand(text, ctx: ctx, chatID: chatID); return }
+            if text.hasPrefix("/") { handleCommand(text, ctx: ctx, chatID: chatID, remoteUserID: remoteUserID); return }
             guard ctx.tryBegin() else {
                 sendMessage(chatID: chatID, text: "上一条还在跑,等它答完再发哈。")
                 return
@@ -1660,7 +1868,10 @@ final class TelegramBot {
                                      botID: ioTagPrefix, toolLabel: tool.label,
                                      incoming: prompt) {
         case .reply(let reply, let resetSession):
-            if resetSession { ctx.setSessionID(nil) }
+            if resetSession {
+                ctx.setSessionID(nil)
+                persistSession(remoteUserID: remoteUserID, ctx: ctx, sessionID: nil)
+            }
             sendMessage(chatID: chatID, text: reply)
         case .proceed(let personalizedPrompt):
             guard ctx.tryBegin() else {
@@ -1710,6 +1921,10 @@ final class TelegramBot {
     /// 文件消息先落隔离目录,再把任务目录交给 agent。下载失败不会进入执行链路。
     private func handleFileMessage(attachments: [FileAttachment], text: String, ctx: ChatContext, chatID: String,
                                    remoteUserID: String, senderName: String) {
+        // 清理必须发生在创建本次任务之前。否则 pruneEmptyDirectories 可能把刚创建、
+        // 还没写入 photo.jpg / meta.json 的空任务目录删掉,导致偶发下载失败。
+        RemoteFileTask.maybeCleanup()
+
         let task: RemoteFileTask
         do {
             task = try RemoteFileTask.create(platform: "telegram", botID: ioTagPrefix, remoteUserID: remoteUserID)
@@ -1718,9 +1933,6 @@ final class TelegramBot {
             sendMessage(chatID: chatID, text: "文件接收失败:无法创建任务目录。")
             return
         }
-
-        // 新建任务后机会式回收历史文件(带 6 小时节流,绝大多数调用直接返回),防 ~/AgentPetRemoteFiles 永久堆积。
-        RemoteFileTask.maybeCleanup()
 
         var saved: [RemoteFileTask.InputFile] = []
         var failures: [String] = []
@@ -1766,6 +1978,7 @@ final class TelegramBot {
                 sendMessage(chatID: chatID, text: "部分文件接收失败,已继续处理成功收到的文件。")
             }
             recentFileTasks[remoteUserID] = task
+            persistRecentFileTask(remoteUserID: remoteUserID, ctx: ctx, taskID: task.taskID)
             PetView.log("Telegram[\(instanceLabel)] user \(remoteUserID) 最近文件任务更新为 \(task.taskID)")
             let names = saved.map(\.storedName).joined(separator: ", ")
             runAgent(prompt: personalizedPrompt, originalPrompt: text.isEmpty ? "Telegram 文件任务:\(names)" : text,
@@ -1790,7 +2003,7 @@ final class TelegramBot {
     }
 
     /// 斜杠指令:/cd 切目录、/pwd 看目录、/new 开新会话、/help 用法。只动该 chat 自己的会话态。
-    private func handleCommand(_ text: String, ctx: ChatContext, chatID: String) {
+    private func handleCommand(_ text: String, ctx: ChatContext, chatID: String, remoteUserID: String) {
         let parts = text.split(separator: " ", maxSplits: 1).map(String.init)
         let cmd = parts[0].lowercased()
         let arg = parts.count > 1 ? parts[1].trimmingCharacters(in: .whitespaces) : ""
@@ -1804,11 +2017,13 @@ final class TelegramBot {
             }
             ctx.setCwd(expanded)
             ctx.setSessionID(nil)   // 换目录即开新会话,免得上下文跨项目串味
+            persistSession(remoteUserID: remoteUserID, ctx: ctx, sessionID: nil)
             sendMessage(chatID: chatID, text: "已切到 \(expanded),并开了新会话。")
         case "/pwd":
             sendMessage(chatID: chatID, text: "当前目录:\(ctx.cwd)")
         case "/new":
             ctx.setSessionID(nil)
+            persistSession(remoteUserID: remoteUserID, ctx: ctx, sessionID: nil)
             sendMessage(chatID: chatID, text: "已开新会话,之前的上下文清空。")
         case "/help", "/start":
             sendMessage(chatID: chatID, text: """
@@ -1829,8 +2044,8 @@ final class TelegramBot {
     }
 
     /// 把消息当 prompt 喂给 agent:派到该 chat 的串行队列后台跑,轮询线程立刻返回继续收别人的消息。
-    /// 流程:桌宠开跑 → 先占一条进度消息 → 边跑边把 cc/cx 的步骤原地编辑进这条消息 → 写回会话 id、解忙 → 收尾进度 + 另发最终正文 → 桌宠收工。
-    /// 调用前 handle 已 tryBegin() 占用。进度回调在 AgentRunner 的读取线程里触发,经 ProgressPanel 节流后才真正发编辑请求,避免触发 Telegram 限流。
+    /// 聊天侧只保留两类状态:开跑占位 + 已答完。中间工具进度仅留在本机日志,避免 Telegram 被步骤刷屏。
+    /// 调用前 handle 已 tryBegin() 占用。
     private func runAgent(prompt: String, originalPrompt: String, ctx: ChatContext, chatID: String,
                           remoteUserID: String, senderName: String, fileTask: RemoteFileTask? = nil) {
         let tool = self.tool
@@ -1840,23 +2055,20 @@ final class TelegramBot {
             PetView.log("Telegram[\(self.instanceLabel)] user \(remoteUserID) 收到 \(originalPrompt.count) 字,开跑")
             let startedAt = Date()   // 墙钟计时起点:供任务监控算"运行了多长时间"
 
-            // 先占一条进度消息,随后原地编辑刷新;拿不到 message_id 则退化为只在跑完发结果。
-            let panelID = self.sendMessage(chatID: chatID, text: fileTask == nil ? "🤖 收到,开跑…" : "🤖 文件已收到,开始处理…")
-            let panel = fileTask == nil
-                ? ProgressPanel(title: "\(tool.label) 远程进度")
-                : ProgressPanel(title: "文件处理中", maxLines: 3)
+            // 先占一条状态消息。运行期间不刷中间步骤,结束时只改成"已答完"。
+            let panelID = self.sendMessage(chatID: chatID, text: fileTask == nil ? "🤖 开跑…" : "🤖 文件已收到,开跑…")
 
             let snap = ctx.snapshot()
             let runCwd = fileTask?.root.path ?? snap.cwd
             let runSessionID = fileTask == nil ? snap.sessionID : nil
             let reply = AgentRunner.run(tool: tool, prompt: prompt, sessionID: runSessionID,
-                                        cwd: runCwd, ioTag: "\(self.ioTagPrefix)-\(chatID)") { [weak self] line in
-                guard let self = self, let panelID = panelID else { return }
-                guard let visibleLine = self.userFacingProgress(line, fileTask: fileTask) else { return }
-                panel.append(visibleLine)
-                if panel.shouldFlush() { self.editMessageText(chatID: chatID, messageID: panelID, text: panel.render()) }
+                                        cwd: runCwd, ioTag: "\(self.ioTagPrefix)-\(chatID)")
+            if fileTask == nil {
+                ctx.setSessionID(reply.sessionID)
+                self.persistSession(remoteUserID: remoteUserID, ctx: ctx, sessionID: reply.sessionID)
+            } else if let fileTask {
+                self.persistRecentFileTask(remoteUserID: remoteUserID, ctx: ctx, taskID: fileTask.taskID)
             }
-            if fileTask == nil { ctx.setSessionID(reply.sessionID) }
             ctx.end()
 
             // 任务监控:落盘本轮"问题→答案"连同发起人、耗时、花费(开关关闭时 record 内部直接跳过)。
@@ -1867,9 +2079,9 @@ final class TelegramBot {
                                    sessionID: reply.sessionID, metrics: reply.metrics)
             }
 
-            // 进度面板收尾(强制刷最后一版),最终正文另发(可能多段、长文)。
+            // 状态消息收尾,最终正文另发(可能多段、长文)。
             if let panelID = panelID {
-                self.editMessageText(chatID: chatID, messageID: panelID, text: panel.renderDone())
+                self.editMessageText(chatID: chatID, messageID: panelID, text: "✅ 已答完")
             }
             self.sendMessage(chatID: chatID, text: self.userFacingReply(reply.text, fileTask: fileTask))
             if let fileTask = fileTask {

@@ -22,7 +22,9 @@ swiftc -swift-version 5 -O \
   "$ROOT/Sources/RemoteControl.swift" \
   "$ROOT/Sources/FeishuRemote.swift" \
   "$ROOT/Sources/TaskMonitor.swift" \
+  "$ROOT/Sources/RemoteUserManager.swift" \
   -framework AppKit \
+  -framework Security \
   -o "$BIN"
 
 echo "==> 写入 Info.plist"
@@ -96,10 +98,13 @@ if [[ -z "$SIGN_IDENTITY" ]]; then
   SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | awk -F '"' '/AgentPet Local Code Signing/ {print $2; exit}')"
 fi
 if [[ -z "$SIGN_IDENTITY" ]]; then
+  SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | awk -F '"' '/ClaudePet Local Code Signing/ {print $2; exit}')"
+fi
+if [[ -z "$SIGN_IDENTITY" ]]; then
   SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | awk -F '"' '/Apple Development/ {print $2; exit}')"
 fi
 if [[ -z "$SIGN_IDENTITY" ]]; then
-  SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | awk -F '"' '/^[[:space:]]*[0-9]+\\)/ {print $2; exit}')"
+  SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | awk -F '"' '/^[[:space:]]*[0-9]+\)/ {print $2; exit}')"
 fi
 if [[ -n "$SIGN_IDENTITY" ]]; then
   codesign --force --sign "$SIGN_IDENTITY" "$APP" 2>/dev/null && echo "(signed with identity: ${SIGN_IDENTITY})" || echo "(identity signing failed)"

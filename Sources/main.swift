@@ -2568,6 +2568,7 @@ final class PetView: NSView {
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "设置...", action: #selector(AppDelegate.showSettings(_:)), keyEquivalent: ","))
         menu.addItem(NSMenuItem(title: "远程遥控(Telegram / 飞书)…", action: #selector(AppDelegate.showRemoteControl(_:)), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "远程用户管理…", action: #selector(AppDelegate.showRemoteUserManager(_:)), keyEquivalent: ""))
         let help = NSMenuItem(title: "使用说明…", action: #selector(showHelp(_:)), keyEquivalent: "")
         help.target = self
         menu.addItem(help)
@@ -3559,6 +3560,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private weak var petView: PetView?
     private var settingsWindowController: SettingsWindowController?
     private var remoteControlWindowController: RemoteControlWindowController?
+    private var remoteUserManagerWindowController: RemoteUserManagerWindowController?
     /// 任务完成提示节流:记下每个(工具+目录)上次弹的时间,窗口内重复来的直接跳过,免得连答几轮时连珠炮
     private var lastTaskDoneAt: [String: Date] = [:]
     private static let taskDoneThrottle: TimeInterval = 8
@@ -3664,6 +3666,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         remoteControlWindowController.showWindow(nil)
         remoteControlWindowController.window?.center()
         remoteControlWindowController.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// 右键「远程用户管理」:汇总 Telegram/飞书用户的会话、个性化设置、文件任务与任务记录。
+    @objc func showRemoteUserManager(_ sender: Any?) {
+        if remoteUserManagerWindowController == nil {
+            remoteUserManagerWindowController = RemoteUserManagerWindowController()
+        }
+        guard let remoteUserManagerWindowController else { return }
+        remoteUserManagerWindowController.showWindow(nil)
+        remoteUserManagerWindowController.window?.center()
+        remoteUserManagerWindowController.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 
@@ -4086,6 +4100,9 @@ MainActor.assumeIsolated {
         print("远程遥控 dryrun(\(tool.label)):不连网,仅打印将执行的命令")
         print("可执行:\(exe ?? "未定位到 \(tool.label) CLI(真跑时会在聊天回报错误)")")
         print("工作目录:\(home)")
+        if tool == .codex {
+            print("CODEX_HOME:\(AgentRunner.prepareRemoteCodexHome())")
+        }
         let first = AgentRunner.command(for: tool, prompt: text, sessionID: nil, cwd: home, lastFile: lastFile)
         print("首轮(无会话):\n  \(show(first))")
         let resume = AgentRunner.command(for: tool, prompt: text, sessionID: "SAMPLE-SESSION-ID", cwd: home, lastFile: lastFile)
@@ -4231,6 +4248,28 @@ MainActor.assumeIsolated {
         // 自测模式:用临时配置文件跑远程 Bot 个性化初始化状态机,不连网、不碰真实配置。
         let ok = RemoteBotSetup.runSelfTest()
         print("远程 Bot 个性化设置 dryrun:\(ok ? "PASS" : "FAIL")")
+        exit(ok ? 0 : 2)
+    }
+
+    if arguments.contains("--remote-session-dryrun") {
+        // 自测模式:离线验证远程会话持久化(cwd/sessionID/最近文件任务),不连网、不碰真实配置。
+        let ok = RemoteSessionStore.runSelfTest()
+        print("远程会话持久化 dryrun:\(ok ? "PASS" : "FAIL")")
+        exit(ok ? 0 : 2)
+    }
+
+    if arguments.contains("--remote-users-dryrun") {
+        // 自测模式:验证远程用户汇总可被监控接口序列化,不连网、不启动 HTTP 服务。
+        let payload: [String: Any] = ["users": RemoteUserAdmin.monitorRows()]
+        let ok = JSONSerialization.isValidJSONObject(payload)
+        print("远程用户管理 dryrun:\(ok ? "PASS" : "FAIL") users=\(RemoteUserAdmin.summaries().count)")
+        exit(ok ? 0 : 2)
+    }
+
+    if arguments.contains("--monitor-admin-dryrun") {
+        // 自测模式:验证监控管理登录 token 生成和校验,不改 Keychain 密码。
+        let ok = MonitorAdminAuth.runSelfTest()
+        print("监控管理员登录 dryrun:\(ok ? "PASS" : "FAIL")")
         exit(ok ? 0 : 2)
     }
 

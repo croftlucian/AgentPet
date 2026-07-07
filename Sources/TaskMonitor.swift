@@ -11,6 +11,7 @@
 
 import AppKit
 import Network
+import Security
 
 /// 一轮调用的计量:墙钟时长之外,Claude 的 result 事件带 CLI 自报的时长 / 花费 / token;
 /// Codex 的 turn.completed 事件带 token,但本地 JSONL 不含可直接落盘的美元花费。
@@ -106,6 +107,106 @@ enum TaskMonitorStore {
             return records
         }
     }
+
+    /// 重写任务记录:用于监控管理页按用户删除历史。仍保持 JSONL 格式,坏行已在 readAll 阶段被跳过。
+    static func removeRecords(source: String, initiatorID: String) -> Int {
+        queue.sync {
+            let decoder = JSONDecoder()
+            let text = (try? String(contentsOfFile: logPath, encoding: .utf8)) ?? ""
+            let all = text.split(separator: "\n", omittingEmptySubsequences: true).compactMap { line -> TaskRecord? in
+                guard let data = line.data(using: .utf8) else { return nil }
+                return try? decoder.decode(TaskRecord.self, from: data)
+            }
+            let records = all.filter { !($0.source == source && $0.initiatorID == initiatorID) }
+            do {
+                try FileManager.default.createDirectory(atPath: dataDirectory, withIntermediateDirectories: true)
+                let encoder = JSONEncoder()
+                var data = Data()
+                for record in records {
+                    guard var row = try? encoder.encode(record) else { continue }
+                    row.append(0x0A)
+                    data.append(row)
+                }
+                try data.write(to: URL(fileURLWithPath: logPath), options: .atomic)
+                return max(0, all.count - records.count)
+            } catch {
+                PetView.log("监控:删除任务记录失败 \(error.localizedDescription)")
+                return 0
+            }
+        }
+    }
+}
+
+/// 监控管理认证:管理员密码放 macOS Keychain,登录后签发内存 token。
+enum MonitorAdminAuth {
+    private static let queue = DispatchQueue(label: "agentpet.monitor.admin.auth")
+    private static let service = "com.agent.pet.monitor.admin"
+    private static let account = "admin"
+    private static let tokenTTL: TimeInterval = 12 * 60 * 60
+    private static var sessions: [String: Date] = [:]
+
+    static func isConfigured() -> Bool { storedPassword() != nil }
+
+    static func setPassword(_ password: String) -> Bool {
+        guard password.count >= 6, let data = password.data(using: .utf8) else { return false }
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+        let attrs: [String: Any] = [kSecValueData as String: data]
+        let status = SecItemUpdate(query as CFDictionary, attrs as CFDictionary)
+        if status == errSecSuccess { return true }
+        var add = query
+        add[kSecValueData as String] = data
+        return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
+    }
+
+    static func verify(password: String) -> Bool { storedPassword() == password }
+
+    static func createSession() -> String {
+        queue.sync {
+            let token = UUID().uuidString + UUID().uuidString
+            sessions[token] = Date().addingTimeInterval(tokenTTL)
+            return token
+        }
+    }
+
+    static func validate(token: String?) -> Bool {
+        guard let token = token, !token.isEmpty else { return false }
+        return queue.sync {
+            guard let expires = sessions[token], expires > Date() else {
+                sessions.removeValue(forKey: token)
+                return false
+            }
+            sessions[token] = Date().addingTimeInterval(tokenTTL)
+            return true
+        }
+    }
+
+    static func revoke(token: String?) {
+        guard let token = token else { return }
+        queue.sync { _ = sessions.removeValue(forKey: token) }
+    }
+
+    static func runSelfTest() -> Bool {
+        let token = createSession()
+        return validate(token: token) && !validate(token: "bad-token")
+    }
+
+    private static func storedPassword() -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var item: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+              let data = item as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
 }
 
 /// 把全部记录聚合成概览统计,供前端直接展示,免得每次都在前端重算。
@@ -187,7 +288,7 @@ final class MonitorServer {
         receive(conn, buffer: Data())
     }
 
-    /// 累积接收直到拿到完整请求头(\r\n\r\n);GET 无 body,请求头到齐即可应答。
+    /// 累积接收直到拿到完整请求头和按 Content-Length 声明的 body。
     private func receive(_ conn: NWConnection, buffer: Data) {
         conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
             guard let self = self else { conn.cancel(); return }
@@ -195,11 +296,16 @@ final class MonitorServer {
             if let data = data { buf.append(data) }
             if let range = buf.range(of: Data("\r\n\r\n".utf8)) {
                 let header = String(data: buf.subdata(in: buf.startIndex..<range.lowerBound), encoding: .utf8) ?? ""
-                self.respond(to: header, on: conn)
-                return
+                let bodyStart = range.upperBound
+                let expected = self.contentLength(in: header)
+                if buf.count >= bodyStart + expected {
+                    let body = expected > 0 ? buf.subdata(in: bodyStart..<(bodyStart + expected)) : Data()
+                    self.respond(to: header, body: body, on: conn)
+                    return
+                }
             }
             if isComplete || error != nil || buf.count > 1_048_576 {
-                self.respond(to: String(data: buf, encoding: .utf8) ?? "", on: conn)
+                self.respond(to: String(data: buf, encoding: .utf8) ?? "", body: Data(), on: conn)
                 return
             }
             self.receive(conn, buffer: buf)
@@ -207,31 +313,126 @@ final class MonitorServer {
     }
 
     /// 解析请求行(METHOD PATH HTTP/1.1),路由后写回响应并关闭连接。
-    private func respond(to header: String, on conn: NWConnection) {
+    private func respond(to header: String, body: Data, on conn: NWConnection) {
         let firstLine = header.split(separator: "\r\n", maxSplits: 1).first.map(String.init) ?? ""
         let parts = firstLine.split(separator: " ").map(String.init)
         let method = parts.count > 0 ? parts[0] : "GET"
         let rawPath = parts.count > 1 ? parts[1] : "/"
         let path = String(rawPath.split(separator: "?").first ?? "/")
+        let token = headerValue("x-agentpet-admin-token", in: header)
 
-        // 预检放行:本地仪表盘允许任意来源(含前端 dev server 跨端口)。
         if method == "OPTIONS" {
-            send(status: "204 No Content", contentType: "text/plain", body: Data(), on: conn)
+            send(status: "403 Forbidden", contentType: "text/plain", body: Data("forbidden".utf8), on: conn)
             return
         }
 
         switch path {
         case "/api/health":
             sendJSON(["ok": true, "records": TaskMonitorStore.readAll().count], on: conn)
+        case "/api/admin/status":
+            sendJSON(["configured": MonitorAdminAuth.isConfigured(),
+                      "authenticated": MonitorAdminAuth.validate(token: token)], on: conn)
+        case "/api/admin/setup":
+            guard method == "POST" else { sendMethodNotAllowed(on: conn); return }
+            guard !MonitorAdminAuth.isConfigured() else {
+                sendJSON(["ok": false, "error": "管理员密码已设置"], status: "409 Conflict", on: conn)
+                return
+            }
+            guard let password = jsonString("password", body: body), MonitorAdminAuth.setPassword(password) else {
+                sendJSON(["ok": false, "error": "密码至少 6 位"], status: "400 Bad Request", on: conn)
+                return
+            }
+            sendJSON(["ok": true, "token": MonitorAdminAuth.createSession()], on: conn)
+        case "/api/admin/login":
+            guard method == "POST" else { sendMethodNotAllowed(on: conn); return }
+            guard let password = jsonString("password", body: body), MonitorAdminAuth.verify(password: password) else {
+                sendJSON(["ok": false, "error": "密码不正确"], status: "401 Unauthorized", on: conn)
+                return
+            }
+            sendJSON(["ok": true, "token": MonitorAdminAuth.createSession()], on: conn)
+        case "/api/admin/logout":
+            MonitorAdminAuth.revoke(token: token)
+            sendJSON(["ok": true], on: conn)
         case "/api/tasks":
+            guard requireAdmin(token: token, on: conn) else { return }
             let records = TaskMonitorStore.readAll()
             let body = (try? JSONEncoder().encode(records.reversed().map { $0 })) ?? Data("[]".utf8)
             send(status: "200 OK", contentType: "application/json; charset=utf-8", body: body, on: conn)
         case "/api/stats":
+            guard requireAdmin(token: token, on: conn) else { return }
             sendJSON(TaskStats.summary(TaskMonitorStore.readAll()), on: conn)
+        case "/api/users":
+            guard requireAdmin(token: token, on: conn) else { return }
+            sendJSON(["users": RemoteUserAdmin.monitorRows()], on: conn)
+        case "/api/users/allowlist":
+            guard method == "POST" else { sendMethodNotAllowed(on: conn); return }
+            guard requireAdmin(token: token, on: conn) else { return }
+            let payload = jsonObject(body)
+            let ok = RemoteUserAdmin.addUser(platform: payload["platform"] as? String ?? "",
+                                             remoteUserID: payload["remoteUserID"] as? String ?? "",
+                                             tool: payload["tool"] as? String ?? "",
+                                             telegramBotToken: payload["telegramBotToken"] as? String ?? "",
+                                             feishuAppID: payload["feishuAppID"] as? String ?? "",
+                                             feishuAppSecret: payload["feishuAppSecret"] as? String ?? "")
+            sendJSON(["ok": ok, "users": RemoteUserAdmin.monitorRows()], status: ok ? "200 OK" : "400 Bad Request", on: conn)
+        case "/api/users/delete":
+            guard method == "POST" else { sendMethodNotAllowed(on: conn); return }
+            guard requireAdmin(token: token, on: conn) else { return }
+            let payload = jsonObject(body)
+            let result = RemoteUserAdmin.deleteUser(platform: payload["platform"] as? String ?? "",
+                                                    remoteUserID: payload["remoteUserID"] as? String ?? "",
+                                                    removeAllowlist: payload["removeAllowlist"] as? Bool ?? true,
+                                                    deleteFiles: payload["deleteFiles"] as? Bool ?? false,
+                                                    deleteTasks: payload["deleteTasks"] as? Bool ?? false)
+            sendJSON(result, on: conn)
+        case "/api/users/clear-session", "/api/users/clear-profile", "/api/users/delete-files", "/api/users/delete-tasks":
+            guard method == "POST" else { sendMethodNotAllowed(on: conn); return }
+            guard requireAdmin(token: token, on: conn) else { return }
+            let payload = jsonObject(body)
+            let platform = payload["platform"] as? String ?? ""
+            let remoteUserID = payload["remoteUserID"] as? String ?? ""
+            let ok: Bool
+            switch path {
+            case "/api/users/clear-session": ok = RemoteUserAdmin.clearSessions(platform: platform, remoteUserID: remoteUserID)
+            case "/api/users/clear-profile": ok = RemoteUserAdmin.clearProfiles(platform: platform, remoteUserID: remoteUserID)
+            case "/api/users/delete-files": ok = RemoteUserAdmin.deleteFiles(platform: platform, remoteUserID: remoteUserID) >= 0
+            default: ok = TaskMonitorStore.removeRecords(source: platform, initiatorID: remoteUserID) >= 0
+            }
+            sendJSON(["ok": ok, "users": RemoteUserAdmin.monitorRows()], status: ok ? "200 OK" : "400 Bad Request", on: conn)
         default:
             serveStatic(path: path, on: conn)
         }
+    }
+
+    private func requireAdmin(token: String?, on conn: NWConnection) -> Bool {
+        guard MonitorAdminAuth.validate(token: token) else {
+            sendJSON(["ok": false, "error": MonitorAdminAuth.isConfigured() ? "需要登录" : "需要先设置管理员密码"],
+                     status: "401 Unauthorized", on: conn)
+            return false
+        }
+        return true
+    }
+
+    private func contentLength(in header: String) -> Int {
+        Int(headerValue("content-length", in: header) ?? "") ?? 0
+    }
+
+    private func headerValue(_ name: String, in header: String) -> String? {
+        for line in header.split(separator: "\r\n").dropFirst() {
+            let parts = line.split(separator: ":", maxSplits: 1).map(String.init)
+            if parts.count == 2, parts[0].lowercased() == name.lowercased() {
+                return parts[1].trimmingCharacters(in: .whitespaces)
+            }
+        }
+        return nil
+    }
+
+    private func jsonObject(_ body: Data) -> [String: Any] {
+        (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] ?? [:]
+    }
+
+    private func jsonString(_ name: String, body: Data) -> String? {
+        (jsonObject(body)[name] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// 静态资源:优先从前端 dist 取文件;命中目录或未知非 /api 路径回退到 index.html(支持前端路由);dist 缺失则发内置页。
@@ -260,9 +461,13 @@ final class MonitorServer {
         }
     }
 
-    private func sendJSON(_ object: Any, on conn: NWConnection) {
+    private func sendJSON(_ object: Any, status: String = "200 OK", on conn: NWConnection) {
         let body = (try? JSONSerialization.data(withJSONObject: object)) ?? Data("{}".utf8)
-        send(status: "200 OK", contentType: "application/json; charset=utf-8", body: body, on: conn)
+        send(status: status, contentType: "application/json; charset=utf-8", body: body, on: conn)
+    }
+
+    private func sendMethodNotAllowed(on conn: NWConnection) {
+        sendJSON(["ok": false, "error": "方法不允许"], status: "405 Method Not Allowed", on: conn)
     }
 
     /// 写回一个完整 HTTP/1.1 响应并关闭连接(短连接,应答即断)。
@@ -270,8 +475,6 @@ final class MonitorServer {
         var head = "HTTP/1.1 \(status)\r\n"
         head += "Content-Type: \(contentType)\r\n"
         head += "Content-Length: \(body.count)\r\n"
-        head += "Access-Control-Allow-Origin: *\r\n"   // 允许前端 dev server 跨端口取数(本地仪表盘)
-        head += "Access-Control-Allow-Methods: GET, OPTIONS\r\n"
         head += "Cache-Control: no-store\r\n"
         head += "Connection: close\r\n\r\n"
         var data = Data(head.utf8)
@@ -318,19 +521,33 @@ final class MonitorServer {
     <header><h1>🐾 AgentPet 任务监控</h1><span class="muted" id="updated"></span>
     <span class="muted" style="margin-left:auto">内置回退页 · 构建 agent-pet-monitor 可得完整仪表盘</span></header>
     <div class="stats" id="stats"></div>
+    <table id="users"><thead><tr><th>平台</th><th>用户</th><th>Bot</th><th>会话</th><th>设置</th><th>文件任务</th><th>任务记录</th><th>最后活动</th></tr></thead><tbody></tbody></table>
     <table id="tbl"><thead><tr><th>时间</th><th>来源/发起人</th><th>工具</th><th>问题</th><th>答案</th><th>时长</th><th>花费</th></tr></thead><tbody></tbody></table>
     <script>
     const fmtDur=ms=>ms<1000?ms+'ms':(ms/1000).toFixed(1)+'s';
     const fmtTime=s=>new Date(s*1000).toLocaleString('zh-CN');
+    const fmtMaybeTime=s=>s>0?fmtTime(s):'—';
     const esc=t=>(t||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
     async function load(){
       try{
-        const [tasks,stats]=await Promise.all([fetch('/api/tasks').then(r=>r.json()),fetch('/api/stats').then(r=>r.json())]);
+        const [tasks,stats,userPayload]=await Promise.all([fetch('/api/tasks').then(r=>r.json()),fetch('/api/stats').then(r=>r.json()),fetch('/api/users').then(r=>r.json())]);
         document.getElementById('updated').textContent='更新于 '+new Date().toLocaleTimeString('zh-CN');
         const cards=[['任务总数',stats.total],['总花费','$'+(stats.totalCostUSD||0).toFixed(4)],
           ['平均时长',fmtDur(stats.avgDurationMs||0)],['输出 token',stats.totalOutputTokens||0],
           ['超时/失败',(stats.timeoutCount||0)+'/'+(stats.errorCount||0)]];
         document.getElementById('stats').innerHTML=cards.map(c=>`<div class="card"><div class="n">${c[1]}</div><div class="l">${c[0]}</div></div>`).join('');
+        const users=(userPayload&&userPayload.users)||[];
+        const ub=document.querySelector('#users tbody');
+        ub.innerHTML=users.length?users.map(u=>`<tr>
+          <td><span class="tag">${esc(u.platform)}</span></td>
+          <td>${esc(u.displayName||u.remoteUserID)}<br><span class="muted">${esc(u.remoteUserID)}</span></td>
+          <td>${esc((u.botIDs||[]).join(','))}</td>
+          <td>${u.hasSessionID?'可续接':(u.sessionCount>0?'无会话ID':'无')}</td>
+          <td>${u.completedProfileCount||0}/${u.profileCount||0}</td>
+          <td>${u.fileTaskCount||0}</td>
+          <td>${u.taskRecordCount||0}</td>
+          <td class="muted">${fmtMaybeTime(u.lastActiveAt||0)}</td>
+        </tr>`).join(''):'<tr><td colspan="8" class="empty">还没有远程用户</td></tr>';
         const tb=document.querySelector('#tbl tbody');
         if(!tasks.length){tb.innerHTML='<tr><td colspan="7" class="empty">还没有任务记录 — 用 Telegram / 飞书远程遥控发一条试试</td></tr>';return;}
         tb.innerHTML=tasks.map(t=>`<tr>

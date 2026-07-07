@@ -604,7 +604,10 @@ final class FeishuBot {
                                      botID: RemoteBotSetup.botID(for: tool), toolLabel: tool.label,
                                      incoming: text) {
         case .reply(let reply, let resetSession):
-            if resetSession { ctx.setSessionID(nil) }
+            if resetSession {
+                ctx.setSessionID(nil)
+                persistSession(inc: inc, ctx: ctx, sessionID: nil)
+            }
             replyAsync(inc, reply)
             return
         case .proceed(let personalizedPrompt):
@@ -633,9 +636,28 @@ final class FeishuBot {
         let key = inc.chatType == "p2p" ? "u:" + inc.senderOpenID : "c:" + inc.chatID + ":u:" + inc.senderOpenID
         if let ctx = contexts[key] { return ctx }
         let tag = tool == .codex ? "cx" : "cc"
-        let ctx = ChatContext(tool: tool, cwd: home, label: "agentpet.feishu.\(tag).\(key)")
+        let botID = RemoteBotSetup.botID(for: tool)
+        let saved = RemoteSessionStore.record(platform: "feishu", remoteUserID: inc.senderOpenID, botID: botID)
+        let cwd = validDirectory(saved?.cwd) ?? home
+        let ctx = ChatContext(tool: tool, cwd: cwd, label: "agentpet.feishu.\(tag).\(key)", sessionID: saved?.sessionID)
         contexts[key] = ctx
+        PetView.log("飞书[\(tool.label)] \(saved == nil ? "新建" : "恢复")会话 open_id \(inc.senderOpenID),目录 \(cwd),session \(saved?.sessionID == nil ? "无" : "有")")
         return ctx
+    }
+
+    private func validDirectory(_ path: String?) -> String? {
+        guard let path = path, !path.isEmpty else { return nil }
+        var isDir: ObjCBool = false
+        return FileManager.default.fileExists(atPath: path, isDirectory: &isDir) && isDir.boolValue ? path : nil
+    }
+
+    private func persistSession(inc: FeishuIncoming, ctx: ChatContext, sessionID: String?) {
+        let snap = ctx.snapshot()
+        RemoteSessionStore.update(platform: "feishu", remoteUserID: inc.senderOpenID,
+                                  botID: RemoteBotSetup.botID(for: tool)) {
+            $0.cwd = snap.cwd
+            $0.sessionID = sessionID
+        }
     }
 
     // MARK: 指令(/cd /pwd /new /help)——只动该会话自己的状态
@@ -654,11 +676,13 @@ final class FeishuBot {
             }
             ctx.setCwd(expanded)
             ctx.setSessionID(nil)
+            persistSession(inc: inc, ctx: ctx, sessionID: nil)
             replyAsync(inc, "已切到 \(expanded),并开了新会话。")
         case "/pwd":
             replyAsync(inc, "当前目录:\(ctx.cwd)")
         case "/new":
             ctx.setSessionID(nil)
+            persistSession(inc: inc, ctx: ctx, sessionID: nil)
             replyAsync(inc, "已开新会话,之前的上下文清空。")
         case "/help", "/start":
             replyAsync(inc, """
@@ -679,8 +703,7 @@ final class FeishuBot {
 
     // MARK: 跑 agent
 
-    /// 把消息当 prompt 喂给 cc/cx:派到该会话串行队列后台跑。流程对齐 Telegram:
-    /// 桌宠开跑 → 占一条进度消息 → 边跑边原地编辑刷新(限次)→ 写回会话 id、解忙 → 收尾进度 + 另发最终正文 → 桌宠收工。
+    /// 把消息当 prompt 喂给 cc/cx:派到该会话串行队列后台跑。聊天侧只保留开跑与已答完,中间步骤不刷屏。
     private func runAgent(prompt: String, originalPrompt: String, inc: FeishuIncoming, ctx: ChatContext) {
         let tool = self.tool
         ctx.queue.async { [weak self] in
@@ -690,19 +713,12 @@ final class FeishuBot {
             let startedAt = Date()   // 墙钟计时起点:供任务监控算运行时长
 
             let panelID = self.reply(inc, "🤖 收到,开跑…")
-            let panel = ProgressPanel(title: "\(tool.label) 远程进度", minInterval: 3.0)
-            var edits = 0
 
             let snap = ctx.snapshot()
             let reply = AgentRunner.run(tool: tool, prompt: prompt, sessionID: snap.sessionID,
-                                        cwd: snap.cwd, ioTag: inc.eventID.isEmpty ? inc.senderOpenID : inc.eventID) { [weak self] line in
-                guard let self = self, let panelID = panelID, edits < Self.maxProgressEdits else { return }
-                panel.append(line)
-                if panel.shouldFlush() {
-                    if self.api.editText(messageID: panelID, text: panel.render()) { edits += 1 }
-                }
-            }
+                                        cwd: snap.cwd, ioTag: inc.eventID.isEmpty ? inc.senderOpenID : inc.eventID)
             ctx.setSessionID(reply.sessionID)
+            self.persistSession(inc: inc, ctx: ctx, sessionID: reply.sessionID)
             ctx.end()
 
             // 任务监控:落盘本轮"问题→答案"连同发起人(飞书 open_id)、耗时、花费(开关关时内部跳过)。
@@ -713,8 +729,8 @@ final class FeishuBot {
                                    status: reply.status, sessionID: reply.sessionID, metrics: reply.metrics)
             }
 
-            if let panelID = panelID, edits < Self.maxProgressEdits {
-                _ = self.api.editText(messageID: panelID, text: panel.renderDone())
+            if let panelID = panelID {
+                _ = self.api.editText(messageID: panelID, text: "✅ 已答完")
             }
             // 最终正文另发(可能长文,按飞书上限切段,复用纯文本切段逻辑)。
             for chunk in TelegramBot.chunks(reply.text, limit: 4000) {
