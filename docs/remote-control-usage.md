@@ -85,13 +85,13 @@ Telegram 可以直接发送文件给 bot，支持 `document`、`photo`、`video`
 每条文件消息都会创建一个独立任务目录：
 
 ```text
-~/AgentPetRemoteFiles/<platform>/<bot>/<remoteUserID>/<yyyy>/<MM>/<dd>/<taskID>/
+~/Library/Application Support/com.agent.pet/remote-files/<platform>/<bot>/<remoteUserID>/<taskID>/
 ```
 
 实际 Telegram 目录示例：
 
 ```text
-~/AgentPetRemoteFiles/telegram/cx-bot2/1000000000/2026/06/22/20260622-213015-a8f3/
+~/Library/Application Support/com.agent.pet/remote-files/telegram/cx-bot2/1000000000/20260707-105410-a8f3/
 ```
 
 每个任务目录固定包含：
@@ -110,7 +110,9 @@ meta.json # 来源、用户、bot、文件、时间和路径记录
 - 原始文件只写入当前任务 `inbox/`。
 - 需要传回 Telegram 的结果必须放进当前任务 `outbox/`。
 - 执行结束后只扫描当前任务 `outbox/` 的普通文件并回传，不支持 `/send 任意路径`。
-- 不同 bot、不同 Telegram 用户、不同任务日期和 `taskID` 都是不同目录，不会互相覆盖。
+- 不同 bot、不同 Telegram 用户和不同 `taskID` 都是不同目录，不会互相覆盖。
+- 旧版 `~/AgentPetRemoteFiles` 会在启动时自动迁移到 Application Support 新位置；早期按 `yyyy/MM/dd` 分桶的历史任务也会自动拍平。
+- 历史任务默认保留 14 天，且总容量默认限制为 2048 MB；可用 `defaults write com.agent.pet remoteFileRetentionDays <天数>` 或 `defaults write com.agent.pet remoteFileMaxTotalMB <MB>` 调整，值小于等于 0 表示关闭对应清理维度。
 - 同一用户在同一个 bot 里上传过文件后，后续直接说“继续改刚才那个文件”“把上一个文档再整理一下”“把刚才的视频再压缩一下”，会自动续接最近一次文件任务，不需要重复上传。
 
 发送方式：
@@ -327,7 +329,7 @@ BIN=./AgentPet.app/Contents/MacOS/AgentPet
 
 用途：
 
-- 核对任务目录形如 `~/AgentPetRemoteFiles/telegram/<bot>/<remoteUserID>/<yyyy>/<MM>/<dd>/<taskID>/`。
+- 核对任务目录形如 `~/Library/Application Support/com.agent.pet/remote-files/telegram/<bot>/<remoteUserID>/<taskID>/`。
 - 确认原始文件只进入 `inbox/`，中间文件放 `work/`，最终回传文件只从 `outbox/` 读取。
 - 确认危险文件名会被清洗，目录和隐藏路径不会逃出任务目录。
 

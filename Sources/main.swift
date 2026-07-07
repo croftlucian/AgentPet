@@ -310,7 +310,7 @@ enum Settings {
         set { UserDefaults.standard.set(newValue, forKey: monitorPluginPathKey) }
     }
 
-    // MARK: 远程文件任务清理 —— 限制 ~/AgentPetRemoteFiles 占用,防远程上传文件永久堆积吃满磁盘
+    // MARK: 远程文件任务清理 —— 限制 Application Support 里的远程文件占用,防上传任务永久堆积吃满磁盘
     private static let remoteFileRetentionDaysKey = "remoteFileRetentionDays"
     private static let remoteFileMaxTotalMBKey = "remoteFileMaxTotalMB"
     static let defaultRemoteFileRetentionDays = 14
@@ -418,6 +418,11 @@ final class PetView: NSView {
     /// 通知提示收尾定时器(发光/笑眼复位),微信未读与任务完成共用
     private var noticeHintTimer: Timer?
     private var bannerHideTimer: Timer?
+    /// 收工庆祝表情复位计时器:连续完成事件时取消旧复位,避免刚开始的新庆祝被旧计时器清掉。
+    private var celebrationResetTimer: Timer?
+    /// 收工庆祝腿部切帧计时器:只在任务完成高跳期间接管腿部,结束后还原 PNG 原腿。
+    private var celebrationLegTimer: Timer?
+    private var celebrationLegPhase = 0
     private var weChatAccessibilityFailureLogged = false
     private var lastWeChatPermissionHintAt = Date.distantPast
     /// 眼睛被空闲动作(眨眼/东张西望)临时接管:置位时 eyeFollow 让路,不把眼神拉回鼠标
@@ -503,6 +508,8 @@ final class PetView: NSView {
         weChatNotificationTimer?.invalidate()
         noticeHintTimer?.invalidate()
         bannerHideTimer?.invalidate()
+        celebrationResetTimer?.invalidate()
+        celebrationLegTimer?.invalidate()
         sessionSweepTimer?.invalidate()
         moodTimer?.invalidate()
         sedentaryTimer?.invalidate()
@@ -633,7 +640,7 @@ final class PetView: NSView {
 
     /// 按当前外观状态(嘴/眼神/眼形)出一帧并送入图层。所有动作改完状态后都走这里,单一出图口径。
     private func render() {
-        let image = Self.starImage(size: iconLayer.bounds.size, mouthOpen: mouthOpen, eyeLook: eyeLook, eyeMode: eyeMode, runPhase: runPhase)
+        let image = Self.starImage(size: iconLayer.bounds.size, mouthOpen: mouthOpen, eyeLook: eyeLook, eyeMode: eyeMode, runPhase: runPhase, celebrationLegPhase: celebrationLegPhase)
         setFrame(image.cgImage(forProposedRect: nil, context: nil, hints: nil))
     }
 
@@ -848,7 +855,7 @@ final class PetView: NSView {
 
     /// Claude Code / Codex 任务完成报喜:橙色(主色)横幅 + 同一套庆祝动作。actionCwd 非空时横幅可点回现场。
     func showTaskDoneHint(message: String, duration: TimeInterval = 6.0, actionCwd: String? = nil, actionTty: String? = nil, force: Bool = false) {
-        flashNotice(message, accent: Style.orange, duration: duration, actionCwd: actionCwd, actionTty: actionTty, force: force)
+        flashNotice(message, accent: Style.orange, duration: duration, actionCwd: actionCwd, actionTty: actionTty, force: force, celebration: true)
     }
 
     /// 远程遥控(Telegram)活动横幅:远程收到指令(start)闪绿"开跑",答完一轮(done)闪橙带摘要,
@@ -860,7 +867,7 @@ final class PetView: NSView {
             flashNotice("\(tool.label) 远程收到指令,开跑…", accent: Self.runningAccent)
         case "done":
             let tail = (summary?.isEmpty == false) ? ":\(summary!)" : ""
-            flashNotice("\(tool.label) 远程答完一轮\(tail)", accent: Style.orange)
+            flashNotice("\(tool.label) 远程答完一轮\(tail)", accent: Style.orange, celebration: true)
         default:
             break
         }
@@ -874,12 +881,16 @@ final class PetView: NSView {
     /// 通用通知观感:顶部弹横幅(accent 决定边框色)+ 发光 + 跳 + 摇 + 眯眼笑,定时复位。
     /// 微信未读与任务完成共用,只是文案与强调色不同——避免两套重复的提示逻辑。
     /// actionCwd:横幅可点回现场的目录(nil 则纯展示);actionTty:精确回窗口用的终端设备;force:主公主动触发(翻译/测试),绕过免打扰。
-    private func flashNotice(_ message: String, accent: NSColor, duration: TimeInterval = 6.0, actionCwd: String? = nil, actionTty: String? = nil, force: Bool = false) {
+    private func flashNotice(_ message: String, accent: NSColor, duration: TimeInterval = 6.0, actionCwd: String? = nil, actionTty: String? = nil, force: Bool = false, celebration: Bool = false) {
         if Settings.petDoNotDisturb && !force { return }   // 免打扰:被动提示一律静音;主动触发的传 force 绕过
         showBanner(message, accent: accent, duration: duration, actionCwd: actionCwd, actionTty: actionTty)
         setFeedGlow(true)
-        jump()
-        sway()
+        if celebration {
+            celebrateTaskDone()
+        } else {
+            jump()
+            sway()
+        }
         let canOwnEyes = !isHovering && !idleEyeActive && eyeMode == .normal
         if canOwnEyes {
             eyeMode = .happy
@@ -1711,6 +1722,81 @@ final class PetView: NSView {
         iconLayer.add(j, forKey: "jump")
     }
 
+    /// 收工庆祝跳:下压蓄力、两段弹跳、落地回弹,再配小幅旋转和张嘴笑。只用于任务完成,普通通知仍保持轻量。
+    private func celebrateTaskDone() {
+        let bounce = CAKeyframeAnimation(keyPath: "transform.translation.y")
+        bounce.values = [0, -Style.windowSize * 0.05, Style.windowSize * 0.42, 0, Style.windowSize * 0.20, 0]
+        bounce.keyTimes = [0, 0.12, 0.32, 0.56, 0.78, 1]
+        bounce.timingFunctions = [
+            CAMediaTimingFunction(name: .easeIn),
+            CAMediaTimingFunction(name: .easeOut),
+            CAMediaTimingFunction(name: .easeIn),
+            CAMediaTimingFunction(name: .easeOut),
+            CAMediaTimingFunction(name: .easeIn),
+        ]
+        bounce.duration = 0.92
+        iconLayer.add(bounce, forKey: "celebrate-bounce")
+
+        let spin = CAKeyframeAnimation(keyPath: "transform.rotation.z")
+        spin.values = [0, -0.10, 0.14, -0.08, 0.04, 0]
+        spin.keyTimes = [0, 0.16, 0.36, 0.58, 0.78, 1]
+        spin.duration = 0.92
+        spin.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        iconLayer.add(spin, forKey: "celebrate-spin")
+
+        mouthOpen = 0.75
+        eyeMode = .happy
+        startCelebrationLegs()
+        celebrationResetTimer?.invalidate()
+        let done = Timer(timeInterval: 0.95, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            self.stopCelebrationLegs()
+            self.mouthOpen = 0
+            self.eyeMode = self.isHovering ? .happy : .normal
+            self.render()
+            self.celebrationResetTimer = nil
+        }
+        RunLoop.main.add(done, forMode: .common)
+        celebrationResetTimer = done
+    }
+
+    private func startCelebrationLegs() {
+        celebrationLegTimer?.invalidate()
+        let frames: [(delay: TimeInterval, phase: Int)] = [
+            (0.00, 1),  // 下压蓄力
+            (0.11, 2),  // 起跳伸腿
+            (0.29, 3),  // 最高点外展
+            (0.52, 4),  // 落地压腿
+            (0.72, 5),  // 回弹站稳
+            (0.92, 0),  // 交还原皮肤
+        ]
+        var index = 0
+        let startedAt = Date()
+        celebrationLegPhase = frames[index].phase
+        render()
+        let timer = Timer(timeInterval: 0.01, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            let elapsed = Date().timeIntervalSince(startedAt)
+            while index + 1 < frames.count, elapsed >= frames[index + 1].delay {
+                index += 1
+                self.celebrationLegPhase = frames[index].phase
+                self.render()
+            }
+            if index >= frames.count - 1 {
+                timer.invalidate()
+                self.celebrationLegTimer = nil
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        celebrationLegTimer = timer
+    }
+
+    private func stopCelebrationLegs() {
+        celebrationLegTimer?.invalidate()
+        celebrationLegTimer = nil
+        celebrationLegPhase = 0
+    }
+
     /// 扑食滑行期间切换跑步腿相位;腿本身仍由 starImage 画进同一帧,不新增图层。
     private func startRunningLegs() {
         guard runTimer == nil else { return }
@@ -2273,7 +2359,7 @@ final class PetView: NSView {
     // MARK: 星星图标渲染
     /// 把 starArt 的方块字符逐个按 2×2 象限自绘成星芒:不走字体、直接填充矩形,
     /// 故无字体拼接缝隙,能严丝合缝还原终端里的样子;cell 取瘦高比例,呼应终端字符格。
-    fileprivate static func starImage(size: CGSize, mouthOpen: CGFloat = 0, eyeLook: CGVector = CGVector(dx: 0, dy: 0), eyeMode: EyeMode = .normal, runPhase: Int = 0) -> NSImage {
+    fileprivate static func starImage(size: CGSize, mouthOpen: CGFloat = 0, eyeLook: CGVector = CGVector(dx: 0, dy: 0), eyeMode: EyeMode = .normal, runPhase: Int = 0, celebrationLegPhase: Int = 0) -> NSImage {
         let image = NSImage(size: size)
         image.lockFocus()
         defer { image.unlockFocus() }
@@ -2282,6 +2368,7 @@ final class PetView: NSView {
         if let petSkin {
             let fitted = aspectFitRect(imageSize: petSkin.size, in: CGRect(origin: .zero, size: size).insetBy(dx: size.width * 0.05, dy: size.height * 0.05))
             petSkin.draw(in: fitted, from: .zero, operation: .sourceOver, fraction: 1)
+            drawSkinCelebrationLegsIfNeeded(ctx, in: fitted, phase: celebrationLegPhase)
             drawSkinFace(ctx, in: fitted, mouthOpen: mouthOpen, eyeLook: eyeLook, eyeMode: eyeMode)
             return image
         }
@@ -2421,6 +2508,108 @@ final class PetView: NSView {
             ctx.addLine(to: CGPoint(x: mouthCenter.x + unit * 0.055, y: mouthCenter.y))
             ctx.strokePath()
         }
+    }
+
+    /// 任务完成庆祝专用腿帧:保留 PNG 主体,只临时擦掉直腿并画屈伸腿。phase 0 表示完全使用原皮肤。
+    private static func drawSkinCelebrationLegsIfNeeded(_ ctx: CGContext, in rect: CGRect, phase: Int) {
+        guard phase > 0 else { return }
+        let poses: [[CGPoint]]
+        switch phase {
+        case 1: // 屈膝蓄力
+            poses = [
+                [CGPoint(x: 0.445, y: 0.292), CGPoint(x: 0.405, y: 0.235), CGPoint(x: 0.435, y: 0.165)],
+                [CGPoint(x: 0.555, y: 0.292), CGPoint(x: 0.595, y: 0.235), CGPoint(x: 0.565, y: 0.165)]
+            ]
+        case 2: // 起跳伸腿
+            poses = [
+                [CGPoint(x: 0.445, y: 0.292), CGPoint(x: 0.430, y: 0.220), CGPoint(x: 0.410, y: 0.145)],
+                [CGPoint(x: 0.555, y: 0.292), CGPoint(x: 0.570, y: 0.220), CGPoint(x: 0.590, y: 0.145)]
+            ]
+        case 3: // 滞空外展
+            poses = [
+                [CGPoint(x: 0.445, y: 0.292), CGPoint(x: 0.412, y: 0.238), CGPoint(x: 0.370, y: 0.165)],
+                [CGPoint(x: 0.555, y: 0.292), CGPoint(x: 0.588, y: 0.238), CGPoint(x: 0.630, y: 0.165)]
+            ]
+        case 4: // 落地压腿
+            poses = [
+                [CGPoint(x: 0.445, y: 0.292), CGPoint(x: 0.405, y: 0.235), CGPoint(x: 0.425, y: 0.160)],
+                [CGPoint(x: 0.555, y: 0.292), CGPoint(x: 0.595, y: 0.235), CGPoint(x: 0.575, y: 0.160)]
+            ]
+        default: // 回弹站稳
+            poses = [
+                [CGPoint(x: 0.445, y: 0.292), CGPoint(x: 0.438, y: 0.225), CGPoint(x: 0.425, y: 0.150)],
+                [CGPoint(x: 0.555, y: 0.292), CGPoint(x: 0.562, y: 0.225), CGPoint(x: 0.575, y: 0.150)]
+            ]
+        }
+
+        clearOriginalSkinLegs(ctx, in: rect)
+        for pose in poses {
+            drawSkinCelebrationLeg(ctx, points: pose.map { point(in: rect, normalized: $0) }, bodySize: rect.size)
+        }
+    }
+
+    private static func clearOriginalSkinLegs(_ ctx: CGContext, in rect: CGRect) {
+        ctx.saveGState()
+        ctx.setBlendMode(.clear)
+        // 只擦原腿下半段和脚掌。腿根留给新腿覆盖,避免把身体底部挖出透明洞造成变形。
+        let regions = [
+            CGRect(x: 0.410, y: 0.070, width: 0.065, height: 0.150),
+            CGRect(x: 0.525, y: 0.070, width: 0.065, height: 0.150),
+            CGRect(x: 0.375, y: 0.055, width: 0.130, height: 0.055),
+            CGRect(x: 0.495, y: 0.055, width: 0.130, height: 0.055),
+        ]
+        for region in regions {
+            ctx.fill(CGRect(x: rect.minX + rect.width * region.minX,
+                            y: rect.minY + rect.height * region.minY,
+                            width: rect.width * region.width,
+                            height: rect.height * region.height).integral)
+        }
+        ctx.restoreGState()
+    }
+
+    private static func point(in rect: CGRect, normalized: CGPoint) -> CGPoint {
+        CGPoint(x: rect.minX + rect.width * normalized.x,
+                y: rect.minY + rect.height * normalized.y)
+    }
+
+    private static func drawSkinCelebrationLeg(_ ctx: CGContext, points: [CGPoint], bodySize: CGSize) {
+        guard points.count >= 2, let foot = points.last else { return }
+        let main = NSColor(srgbRed: 0xF0 / 255.0, green: 0x52 / 255.0, blue: 0x22 / 255.0, alpha: 1.0)
+        let dark = NSColor(srgbRed: 0x96 / 255.0, green: 0x2F / 255.0, blue: 0x15 / 255.0, alpha: 1.0)
+        let unit = min(bodySize.width, bodySize.height)
+        let shadowOffset = CGSize(width: unit * 0.009, height: -unit * 0.011)
+
+        func stroke(_ pts: [CGPoint], color: NSColor, width: CGFloat) {
+            ctx.setShouldAntialias(false)
+            ctx.setLineCap(.butt)
+            ctx.setLineJoin(.miter)
+            ctx.setStrokeColor(color.cgColor)
+            ctx.setLineWidth(width)
+            ctx.beginPath()
+            ctx.move(to: pts[0])
+            for point in pts.dropFirst() {
+                ctx.addLine(to: point)
+            }
+            ctx.strokePath()
+        }
+
+        stroke(points.map { CGPoint(x: $0.x + shadowOffset.width, y: $0.y + shadowOffset.height) },
+               color: dark,
+               width: unit * 0.042)
+        stroke(points, color: main, width: unit * 0.033)
+
+        let prev = points[points.count - 2]
+        let footWidth = unit * 0.078
+        let footHeight = unit * 0.036
+        let leansRight = foot.x >= prev.x
+        let footRect = CGRect(x: foot.x - (leansRight ? footWidth * 0.28 : footWidth * 0.72),
+                              y: foot.y - footHeight * 0.45,
+                              width: footWidth,
+                              height: footHeight).integral
+        ctx.setFillColor(dark.cgColor)
+        ctx.fill(footRect.offsetBy(dx: shadowOffset.width, dy: shadowOffset.height))
+        ctx.setFillColor(main.cgColor)
+        ctx.fill(footRect)
     }
 
     /// 跑步态只改原本底部两条腿:先用背景橙补掉静止腿,再画成交替前后摆动的短腿。
@@ -3564,6 +3753,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 任务完成提示节流:记下每个(工具+目录)上次弹的时间,窗口内重复来的直接跳过,免得连答几轮时连珠炮
     private var lastTaskDoneAt: [String: Date] = [:]
     private static let taskDoneThrottle: TimeInterval = 8
+    var shouldShowStartupCelebration = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         PetView.log("AgentPet 启动 feed-script-v2")
@@ -3637,6 +3827,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let aliasOutcome = ShellAliasInstaller.ensure(dryRun: false)
         if !aliasOutcome.added.isEmpty {
             petView.flashInfo("已为你装好 \(aliasOutcome.added.joined(separator: "/")) 命令,新开终端即可用")
+        }
+        if shouldShowStartupCelebration {
+            let timer = Timer(timeInterval: 0.4, repeats: false) { [weak petView] _ in
+                petView?.showTaskDoneHint(message: "cc · 任务完成", duration: 4, force: true)
+            }
+            RunLoop.main.add(timer, forMode: .common)
         }
     }
 
@@ -3903,6 +4099,7 @@ func runInstallAliasesSelfTest() -> Bool {
 
 MainActor.assumeIsolated {
     let arguments = CommandLine.arguments
+    let showStartupCelebration = arguments.contains("--test-celebration")
     if let idx = arguments.firstIndex(of: "--render-test") {
         // 自测模式:渲染一帧后退出
         let out = idx + 1 < arguments.count ? arguments[idx + 1] : "/tmp/agentpet.png"
@@ -4311,6 +4508,7 @@ MainActor.assumeIsolated {
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory) // 不占 Dock、不抢焦点,等价 LSUIElement
     let delegate = AppDelegate()
+    delegate.shouldShowStartupCelebration = showStartupCelebration
     app.delegate = delegate
     app.run()
 }

@@ -1934,6 +1934,9 @@ final class TelegramBot {
             return
         }
 
+        // 新建任务后机会式回收历史文件(带 6 小时节流,绝大多数调用直接返回),防 Application Support 里的远程文件永久堆积。
+        RemoteFileTask.maybeCleanup()
+
         var saved: [RemoteFileTask.InputFile] = []
         var failures: [String] = []
         for attachment in attachments {
